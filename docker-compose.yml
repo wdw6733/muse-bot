@@ -1,0 +1,21 @@
+services:
+  bot3:
+    build: .
+    container_name: tg-bot3
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Docker Engine API：管理 NAS 上的容器
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 只读挂载：读 NAS 主机的负载、内存、磁盘
+      - /proc:/host/proc:ro
+      - /:/host:ro
+      # 只读挂载：读温度传感器（VM 内通常读不到，没有它温度按钮会直接提示）
+      - /sys:/host/sys:ro
+      # 只读挂载：读数据盘用量（必须是宿主机上真实存在的路径）
+      - /mnt/PT:/host/mnt/PT:ro
+      - /mnt/Strongge:/host/mnt/Strongge:ro
+      # 轮询 offset 持久化
+      - ./data:/data
+      # 机器人代码文件挂载（可写，自我更新靠它把新代码写回宿主机；不要加 :ro）
+      - ./bot.py:/app/bot.py
