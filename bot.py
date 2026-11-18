@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""3 号机器人：NAS + Docker + ESXi 管理（v2.2.1：命令 + 快捷按钮 + 告警 + 自我更新）。
+"""3 号机器人：NAS + Docker + ESXi 管理（v2.2.2：命令 + 快捷按钮 + 告警 + 自我更新）。
 
 部署在 NAS（ESXi 上的 VM）里的 Docker 容器中，通过 OpenBox SOCKS5 代理
 访问 Telegram Bot API（长轮询，不需要 webhook、不需要开 inbound 端口）。
@@ -14,7 +14,7 @@
 - 主动告警：容器意外停了、磁盘/负载/内存超阈值会主动提醒（可关）。
 - 自我更新：GitHub 检查更新或主人发 bot.py 文件，验证后安装重启。
 - 容器更新：拉新镜像并重建，旧容器保留到新容器跑起来后才删。
-- 磁盘用量用 🟥/🟩 彩条显示；容器管理改成 3 列网格。
+- CPU/内存/磁盘用量都用 🟥/🟩 彩条显示；容器管理改成 3 列网格。
 """
 
 import concurrent.futures
@@ -65,7 +65,7 @@ _HOST_DATA_PATHS_RAW = os.environ.get("HOST_DATA_PATHS", "").strip()
 HOST_DATA_PATHS = [p.strip() for p in _HOST_DATA_PATHS_RAW.split(",") if p.strip()] or ["/mnt/PT", "/mnt/Strongge"]
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
-BOT_VERSION = "2.2.1"
+BOT_VERSION = "2.2.2"
 SELF_CONTAINER_NAME = os.environ.get("SELF_CONTAINER_NAME", "tg-bot3").strip() or "tg-bot3"
 ALERT_ENABLED_DEFAULT = os.environ.get("ALERT_ENABLED", "1").strip() not in ("0", "false", "no")
 ALERT_INTERVAL_SEC = _env_int("ALERT_INTERVAL_SEC", 300)
@@ -762,7 +762,7 @@ def fmt_status():
     lines = [f"💻 NAS 状态（{cst_now()}）"]
     cpu = cpu_percent()
     if cpu is not None:
-        lines.append(f"CPU：{bar(cpu)} {cpu:.0f}%")
+        lines.append(f"CPU：{color_bar(cpu)} {cpu:.0f}%")
     load = _loadavg()
     if load:
         lines.append(f"负载 1/5/15 分钟：{' / '.join(load)}（{_cpu_count()} 线程）")
@@ -772,7 +772,7 @@ def fmt_status():
         avail = mem.get("MemAvailable", 0)
         used = total - avail
         pct = used / total * 100.0 if total else 0.0
-        lines.append(f"内存：{bar(pct)} {fmt_gib_from_kib(used)} / {fmt_gib_from_kib(total)}（{pct:.0f}%）")
+        lines.append(f"内存：{color_bar(pct)} {fmt_gib_from_kib(used)} / {fmt_gib_from_kib(total)}（{pct:.0f}%）")
         if mem.get("SwapTotal"):
             swap_used = mem["SwapTotal"] - mem.get("SwapFree", 0)
             lines.append(f"交换：{fmt_gib_from_kib(swap_used)} / {fmt_gib_from_kib(mem['SwapTotal'])}")

@@ -1,4 +1,4 @@
-# 3 号机器人：NAS + Docker + ESXi 管理（v2.2.1：命令 + 快捷按钮 + 告警 + 自我更新）
+# 3 号机器人：NAS + Docker + ESXi 管理（v2.2.2：命令 + 快捷按钮 + 告警 + 自我更新）
 
 部署在 NAS（ESXi 上的 VM）里的 Docker 容器。经 OpenBox SOCKS5 访问
 Telegram Bot API，长轮询收消息，不需要 webhook，不需要开 inbound 端口，
@@ -10,7 +10,7 @@ Telegram Bot API，长轮询收消息，不需要 webhook，不需要开 inbound
   可在告警页开关（默认开）。
 - 自我更新：主菜单点“检查更新”，从 GitHub 仓库拉新版 bot.py，验证后安装
   重启；也可以直接把新版 bot.py 文件发给机器人。旧版自动备份。
-- 磁盘用量用 🟥（已用）/🟩（未用）彩条显示；容器管理改成 3 列网格，每页 9 个。
+- CPU、内存、磁盘用量都用 🟥（已用）/🟩（未用）彩条显示；容器管理改成 3 列网格，每页 9 个。
 - Docker：直接读 `/var/run/docker.sock` 调 Engine API，不依赖 docker CLI。
 - NAS 主机状态：读只读挂载的 `/host/proc`、`/host/sys` 和 `df /host`；
   磁盘默认看 `/mnt/PT` 和 `/mnt/Strongge`（compose 里已显式挂载，
