@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""3 号机器人：NAS + Docker + ESXi 管理（v2.2.2：命令 + 快捷按钮 + 告警 + 自我更新）。
+"""3 号机器人：NAS + Docker + ESXi 管理（v2.3.0：命令 + 快捷按钮 + 告警 + 自我更新 + 镜像更新检测）。
 
 部署在 NAS（ESXi 上的 VM）里的 Docker 容器中，通过 OpenBox SOCKS5 代理
 访问 Telegram Bot API（长轮询，不需要 webhook、不需要开 inbound 端口）。
@@ -15,6 +15,7 @@
 - 自我更新：GitHub 检查更新或主人发 bot.py 文件，验证后安装重启。
 - 容器更新：拉新镜像并重建，旧容器保留到新容器跑起来后才删。
 - CPU/内存/磁盘用量都用 🟥/🟩 彩条显示；容器管理改成 3 列网格。
+- 容器镜像更新检测：每 6 小时自动检查全部容器，有新镜像就通知，点按钮确认后才更新。
 """
 
 import concurrent.futures
@@ -65,7 +66,7 @@ _HOST_DATA_PATHS_RAW = os.environ.get("HOST_DATA_PATHS", "").strip()
 HOST_DATA_PATHS = [p.strip() for p in _HOST_DATA_PATHS_RAW.split(",") if p.strip()] or ["/mnt/PT", "/mnt/Strongge"]
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
-BOT_VERSION = "2.2.2"
+BOT_VERSION = "2.3.0"
 SELF_CONTAINER_NAME = os.environ.get("SELF_CONTAINER_NAME", "tg-bot3").strip() or "tg-bot3"
 ALERT_ENABLED_DEFAULT = os.environ.get("ALERT_ENABLED", "1").strip() not in ("0", "false", "no")
 ALERT_INTERVAL_SEC = _env_int("ALERT_INTERVAL_SEC", 300)
@@ -76,6 +77,8 @@ ALERT_COOLDOWN_SEC = _env_int("ALERT_COOLDOWN_SEC", 3600)
 UPDATE_REPO = os.environ.get("UPDATE_REPO", "").strip()
 UPDATE_BRANCH = os.environ.get("UPDATE_BRANCH", "main").strip() or "main"
 UPDATE_TOKEN = os.environ.get("UPDATE_TOKEN", "").strip()
+IMAGE_CHECK_ENABLED = os.environ.get("IMAGE_CHECK_ENABLED", "1").strip() not in ("0", "false", "no")
+IMAGE_CHECK_INTERVAL_SEC = _env_int("IMAGE_CHECK_INTERVAL_SEC", 21600)
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 MAX_REPLY = 3800
@@ -1538,6 +1541,161 @@ def kb(rows):
     return {"inline_keyboard": rows}
 
 
+# ---------------- 容器镜像更新检测 ----------------
+# 每 6 小时自动检查全部容器的镜像：拉取最新镜像，比对镜像 Id。
+# 有新镜像就通知主人，点按钮确认后才重建（走 update_container_flow）。
+# 3 号自己的容器跳过（走 GitHub 自我更新）；同一个新版本只通知一次。
+
+_IMAGE_CHECK_LOCK = threading.Lock()
+
+
+def _image_check_state_path():
+    return os.path.join(DATA_DIR, "image_check.json")
+
+
+def _load_image_check_state():
+    try:
+        with open(_image_check_state_path(), "r", encoding="utf-8") as f:
+            state = json.load(f)
+        if isinstance(state, dict):
+            state.setdefault("notified", {})
+            return state
+    except (OSError, ValueError):
+        pass
+    return {"notified": {}}
+
+
+def _save_image_check_state(state):
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = _image_check_state_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, _image_check_state_path())
+    except OSError as e:
+        log("保存镜像检查状态失败：", e)
+
+
+def check_container_image_updates():
+    """检查全部容器：返回每容器的检查结果（update/current/error/skipped）。"""
+    try:
+        items = list_containers()
+    except Exception as e:
+        return [{"status": "fatal", "error": str(e)}]
+    results = []
+    for c in sorted(items, key=container_display_name):
+        name = container_display_name(c)
+        cid = c["Id"]
+        if name == SELF_CONTAINER_NAME:
+            continue
+        image_ref = (c.get("Image") or "").strip()
+        base = {"cid": cid, "name": name, "image": image_ref}
+        if not image_ref:
+            results.append({**base, "status": "error", "error": "读不到镜像名"})
+            continue
+        try:
+            inspect_data = inspect_container(cid)
+        except Exception as e:
+            results.append({**base, "status": "error", "error": f"读详情失败：{e}"})
+            continue
+        old_id = inspect_data.get("Image", "")
+        try:
+            ok, pull_msg = docker_pull(image_ref, timeout=300)
+        except ValueError as e:
+            # digest 固定的镜像拉了也没用，直接跳过。
+            results.append({**base, "status": "skipped", "error": str(e)})
+            continue
+        except Exception as e:
+            results.append({**base, "status": "error", "error": f"拉取失败：{e}"})
+            continue
+        if not ok:
+            results.append({**base, "status": "error", "error": pull_msg})
+            continue
+        try:
+            img = docker_json("GET", "/images/" + quote(image_ref, safe="") + "/json")
+            new_id = img.get("Id", "")
+        except Exception as e:
+            results.append({**base, "status": "error", "error": f"读镜像信息失败：{e}"})
+            continue
+        if old_id and new_id and new_id != old_id:
+            results.append({**base, "status": "update", "old_id": old_id, "new_id": new_id})
+        else:
+            results.append({**base, "status": "current", "old_id": old_id, "new_id": new_id})
+    return results
+
+
+def format_image_check_report(results):
+    """检查结果文本 + 键盘（每个有更新的容器一个确认按钮）。"""
+    updates = [r for r in results if r["status"] == "update"]
+    current = sum(1 for r in results if r["status"] == "current")
+    problems = [r for r in results if r["status"] in ("error", "skipped")]
+    lines = [f"🔍 容器镜像更新检查（{cst_now()}）"]
+    if updates:
+        lines.append("")
+        for r in updates:
+            lines.append(f"⬆️ {r['name']}（{r['image']}）有新镜像")
+    else:
+        lines.append("\n全部容器都已是最新。")
+    lines.append(f"\n共 {len(results)} 个容器：{len(updates)} 个有更新，{current} 个已是最新，{len(problems)} 个检查失败/跳过。")
+    for r in problems[:5]:
+        lines.append(f"⚠️ {r['name']}：{r.get('error', '')[:40]}")
+    if len(problems) > 5:
+        lines.append(f"…还有 {len(problems) - 5} 个未列出。")
+    if updates:
+        lines.append("\n点下面的按钮确认更新哪个，不点就不动。")
+    rows = [[btn(f"⬆️ 更新 {r['name']}", f"c:ask:update:{r['cid'][:12]}")] for r in updates]
+    rows.append([btn("⬅️ 主菜单", "menu:main")])
+    return truncate("\n".join(lines)), kb(rows)
+
+
+def run_image_check(manual, chat_id):
+    """跑一次全量检查。手动触发总是回报告；自动触发只在有“新”更新时通知。"""
+    results = check_container_image_updates()
+    if results and results[0].get("status") == "fatal":
+        if manual:
+            send_reply(chat_id, f"🔍 镜像更新检查失败：{results[0].get('error')}", reply_markup=back_keyboard())
+        else:
+            log("镜像更新自动检查失败：", results[0].get("error"))
+        return
+    state = _load_image_check_state()
+    notified = state.get("notified", {})
+    present = {r["cid"] for r in results}
+    has_new = False
+    for r in results:
+        if r["status"] == "update":
+            if notified.get(r["cid"]) != r["new_id"]:
+                notified[r["cid"]] = r["new_id"]
+                has_new = True
+        elif r["status"] == "current":
+            notified.pop(r["cid"], None)
+    for cid in list(notified):
+        if cid not in present:
+            del notified[cid]
+    state["notified"] = notified
+    state["last_check"] = time.time()
+    _save_image_check_state(state)
+    if manual or has_new:
+        text, markup = format_image_check_report(results)
+        send_reply(chat_id, text, reply_markup=markup)
+
+
+def start_image_check(manual, chat_id):
+    """在后台线程跑检查。返回 False 表示已有检查在进行中。"""
+    if not _IMAGE_CHECK_LOCK.acquire(blocking=False):
+        return False
+
+    def _run():
+        try:
+            run_image_check(manual, chat_id)
+        except Exception:
+            log("镜像检查出错：", traceback.format_exc(limit=3))
+        finally:
+            _IMAGE_CHECK_LOCK.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True
+
+
 def main_keyboard():
     return kb([
         [btn("📊 系统状态", "menu:status"), btn("🌐 公网 IP", "menu:ip")],
@@ -1547,6 +1705,7 @@ def main_keyboard():
         [btn("🛠️ 容器管理", "menu:manage:0"), btn("🖥️ ESXi VM", "menu:esxi")],
         [btn("🔄 重启 NAS", "menu:reboot")],
         [btn("⬆️ 检查更新", "menu:update"), btn("🔔 告警", "menu:alerts")],
+        [btn("🔍 检查容器更新", "menu:check_updates")],
         [url_btn("🤖 给 Muse 下指令", f"https://t.me/{MUSE_BOT_USERNAME}")],
     ])
 
@@ -1566,7 +1725,7 @@ NAS、容器、ESXi 的事都在这里执行，不用去 2 号。
 
 生图、生视频、查资料等，点“给 Muse 下指令”去 2 号机器人。
 
-命令也一样能用：/status /docker /esxi /disk /help"""
+命令也一样能用：/status /docker /esxi /disk /check_updates /help"""
 
 
 HELP = """3 号机器人：NAS + Docker + ESXi 管理
@@ -1584,6 +1743,7 @@ HELP = """3 号机器人：NAS + Docker + ESXi 管理
 /esxi on|off|kill <VM 名或 ID> 开机/优雅关机/强制断电
 /disk 磁盘用量
 /update 检查自我更新
+/check_updates 检查全部容器镜像更新
 /alerts 告警状态（on/off 开关）
 /menu 打开快捷按钮菜单
 /help 帮助
@@ -1741,6 +1901,12 @@ def handle_plain_text(raw, chat_id, message_id):
             reply = ("要执行操作，请点下面的按钮选容器/VM 再点确认，或直接发命令（/docker、/esxi），"
                      "我直接在 NAS 上执行，不用去 2 号。只看状态的话直接说“系统状态”“磁盘空间”就行。")
             markup = main_keyboard()
+        elif any(k in text for k in ("检查更新", "镜像更新", "容器更新", "更新容器", "有更新")):
+            if start_image_check(manual=True, chat_id=chat_id):
+                reply = "🔍 正在检查全部容器的镜像更新（约 1-2 分钟），查完会发消息。"
+            else:
+                reply = "正在检查镜像更新，稍等。"
+            markup = back_keyboard()
         elif any(k in text for k in ("系统状态", "状态", "负载", "内存", "cpu")):
             reply, markup = fmt_status(), refresh_back_keyboard("menu:status")
         elif "公网" in text or "出口" in text or text.strip() == "ip":
@@ -1846,6 +2012,14 @@ def handle(text, chat_id, message_id):
         elif cmd == "update":
             text, markup = check_github_update()
             send_reply(chat_id, text, reply_to=message_id, reply_markup=markup)
+            return
+        elif cmd == "check_updates":
+            if start_image_check(manual=True, chat_id=chat_id):
+                send_reply(chat_id, "🔍 正在检查全部容器的镜像更新（约 1-2 分钟），查完会发消息。",
+                           reply_to=message_id, reply_markup=back_keyboard())
+            else:
+                send_reply(chat_id, "正在检查镜像更新，稍等。",
+                           reply_to=message_id, reply_markup=back_keyboard())
             return
         elif cmd == "alerts":
             if args and args[0] == "on":
@@ -1969,6 +2143,11 @@ def handle_callback(query):
         elif data == "menu:update_cancel":
             _clear_staging()
             _edit_or_send(chat_id, message_id, "已取消更新。", back_keyboard())
+        elif data == "menu:check_updates":
+            if start_image_check(manual=True, chat_id=chat_id):
+                _edit_or_send(chat_id, message_id, "🔍 正在检查全部容器的镜像更新（约 1-2 分钟），查完会发消息。", back_keyboard())
+            else:
+                _edit_or_send(chat_id, message_id, "正在检查镜像更新，稍等。", back_keyboard())
         elif data == "menu:alerts":
             _edit_or_send(chat_id, message_id, alerts_status_text(), alerts_keyboard())
         elif data in ("alerts:on", "alerts:off"):
@@ -2092,16 +2271,21 @@ def main():
         "代理：", SOCKS_PROXY or "直连",
         "ESXi：", "已配置" if esxi_configured() else "未配置",
         "磁盘路径：", ",".join(HOST_DATA_PATHS),
+        "镜像检查：", ("开/" + str(IMAGE_CHECK_INTERVAL_SEC) + "s") if IMAGE_CHECK_ENABLED else "关",
         "版本：", BOT_VERSION)
     announce_pending_update()
     _alert_init_baseline()
     last_health = time.monotonic()
+    next_image_check = time.monotonic() + 60  # 启动 60 秒后先查一次，之后按间隔自动查
     offset = load_offset()
     while True:
         try:
             if time.monotonic() - last_health >= ALERT_INTERVAL_SEC:
                 last_health = time.monotonic()
                 health_check_safe()
+            if IMAGE_CHECK_ENABLED and time.monotonic() >= next_image_check:
+                next_image_check = time.monotonic() + IMAGE_CHECK_INTERVAL_SEC
+                start_image_check(manual=False, chat_id=OWNER_CHAT_ID)
             payload = {"timeout": 30, "allowed_updates": ["message", "callback_query"], "limit": 20}
             if offset is not None:
                 payload["offset"] = offset
