@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""3 号机器人：NAS + Docker + ESXi 管理（v2.3.0：命令 + 快捷按钮 + 告警 + 自我更新 + 镜像更新检测）。
+"""3 号机器人：NAS + Docker + ESXi 管理（v2.3.1：命令 + 快捷按钮 + 告警 + 自我更新 + 镜像更新检测）。
 
 部署在 NAS（ESXi 上的 VM）里的 Docker 容器中，通过 OpenBox SOCKS5 代理
 访问 Telegram Bot API（长轮询，不需要 webhook、不需要开 inbound 端口）。
@@ -16,6 +16,7 @@
 - 容器更新：拉新镜像并重建，旧容器保留到新容器跑起来后才删。
 - CPU/内存/磁盘用量都用 🟥/🟩 彩条显示；容器管理改成 3 列网格。
 - 容器镜像更新检测：每 6 小时自动检查全部容器，有新镜像就通知，点按钮确认后才更新。
+- 容器/VM 列表按钮文字等宽对齐：名字按显示宽度补齐，同一行 🟢/🔴 圆点横向对齐。
 """
 
 import concurrent.futures
@@ -30,6 +31,7 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
@@ -66,7 +68,7 @@ _HOST_DATA_PATHS_RAW = os.environ.get("HOST_DATA_PATHS", "").strip()
 HOST_DATA_PATHS = [p.strip() for p in _HOST_DATA_PATHS_RAW.split(",") if p.strip()] or ["/mnt/PT", "/mnt/Strongge"]
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
-BOT_VERSION = "2.3.0"
+BOT_VERSION = "2.3.1"
 SELF_CONTAINER_NAME = os.environ.get("SELF_CONTAINER_NAME", "tg-bot3").strip() or "tg-bot3"
 ALERT_ENABLED_DEFAULT = os.environ.get("ALERT_ENABLED", "1").strip() not in ("0", "false", "no")
 ALERT_INTERVAL_SEC = _env_int("ALERT_INTERVAL_SEC", 300)
@@ -1751,6 +1753,38 @@ HELP = """3 号机器人：NAS + Docker + ESXi 管理
 只认主人一个人，没有任意命令执行。危险操作要点两次确认。"""
 
 
+# ---------- 按钮文字等宽对齐 ----------
+# Telegram 会把同一行按钮里的文字居中显示：名字长短不一时，开头的 🟢/🔴
+# 横向位置各不相同，看起来就没对齐。把名字按显示宽度补齐到固定宽度，
+# 同一行每个按钮的文字总宽度一致，圆点就对齐了（中文算 2 格，超长截断）。
+MANAGE_NAME_WIDTH = 12
+
+
+def display_width(text):
+    w = 0
+    for ch in text:
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def pad_name(name, width=MANAGE_NAME_WIDTH):
+    if display_width(name) > width:
+        out = ""
+        w = 0
+        for ch in name:
+            cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+            if w + cw > width - 1:
+                break
+            out += ch
+            w += cw
+        return out + "…"
+    return name + " " * (width - display_width(name))
+
+
+def status_button_label(emoji, name):
+    return f"{emoji} {pad_name(name)}"
+
+
 def manage_keyboard(page):
     items = sorted(list_containers(), key=container_display_name)
     total_pages = max(1, (len(items) + MANAGE_PAGE_SIZE - 1) // MANAGE_PAGE_SIZE)
@@ -1761,7 +1795,7 @@ def manage_keyboard(page):
         row = []
         for c in page_items[i:i + 3]:
             emoji = "🟢" if c.get("State") == "running" else "🔴"
-            row.append(btn(f"{emoji} {container_display_name(c)}", f"c:detail:{c['Id'][:12]}"))
+            row.append(btn(status_button_label(emoji, container_display_name(c)), f"c:detail:{c['Id'][:12]}"))
         rows.append(row)
     nav = []
     if page > 0:
@@ -1793,7 +1827,7 @@ def esxi_list_keyboard(vms):
     rows = []
     for v in vms:
         emoji = "🟢" if v.get("state") == "on" else "🔴"
-        rows.append([btn(f"{emoji} {v['name']}", f"e:detail:{v['vmid']}")])
+        rows.append([btn(status_button_label(emoji, v['name']), f"e:detail:{v['vmid']}")])
     rows.append([btn("⬅️ 主菜单", "menu:main")])
     return kb(rows)
 

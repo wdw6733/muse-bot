@@ -1,4 +1,6 @@
-# 3 号机器人：NAS + Docker + ESXi 管理（v2.3.0：命令 + 快捷按钮 + 告警 + 自我更新 + 镜像更新检测）
+# 3 号机器人：NAS + Docker + ESXi 管理（v2.3.1：命令 + 快捷按钮 + 告警 + 自我更新 + 镜像更新检测）
+
+> v2.3.1（2026-11-19）：容器/VM 列表按钮文字等宽对齐，同一行 🟢/🔴 圆点横向对齐。
 
 部署在 NAS（ESXi 上的 VM）里的 Docker 容器。经 OpenBox SOCKS5 访问
 Telegram Bot API，长轮询收消息，不需要 webhook，不需要开 inbound 端口，
