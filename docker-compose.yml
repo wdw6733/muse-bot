@@ -19,3 +19,6 @@ services:
       - ./data:/data
       # 机器人代码文件挂载（可写，自我更新靠它把新代码写回宿主机；不要加 :ro）
       - ./bot.py:/app/bot.py
+      # TrueNAS SSH 密钥（v2.5.0，可选）：把私钥放 ./truenas_key（不要提交），只读挂载。
+      # 用密码或 API 时不用这个挂载，直接删掉这行；文件不存在时 Docker 会建一个空目录代替。
+      - ./truenas_key:/keys/truenas_key:ro
