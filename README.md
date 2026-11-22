@@ -1,6 +1,16 @@
-# 3 号机器人：NAS + Docker + ESXi 管理（v2.3.1：命令 + 快捷按钮 + 告警 + 自我更新 + 镜像更新检测）
+# 3 号机器人：NAS + Docker + ESXi 管理（v2.5.0：内存 TOP5 + 操作授权确认 + TrueNAS 系统服务）
 
+> v2.5.0（2026-11-22，未部署，先审后装）：打字就能操作，不再只靠按钮菜单。
+> v2.4.0（2026-11-21，未部署）：精简菜单 + 美化状态/TOP + 容器更新可忽略/升级。
 > v2.3.1（2026-11-19）：容器/VM 列表按钮文字等宽对齐，同一行 🟢/🔴 圆点横向对齐。
+
+## v2.5.0 新功能
+
+- **内存 TOP5**：发“内存 TOP5”或 `/topmem`，按内存占用排前 5 名（只读，立即回，不用确认）。
+- **打字操作 + 授权确认**：发“重启 plex”“停止 cifs”“启动 ssh”，机器人先回“确定要重启 XX 吗”，你点 ✅ 才执行，❌ 取消；5 分钟过期，只认主人。目标先对实时列表校验：容器对 Docker 列表，系统服务对 TrueNAS 服务列表，找不到的直接说找不到，不猜、不执行。
+- **TrueNAS 系统服务**：发“系统服务”或 `/services` 看实时列表。走 NAS 主机 SSH 的 `midclt call service.*`（优先），或 REST API（备用，TrueNAS 26 已移除 REST，26 及以后必须用 SSH）。`middlewared`、`docker` 等关键服务永不重启。
+- **没有任意命令执行**：只认固定几种操作（查状态/内存/进程/服务列表、重启/启停指定容器或服务），注入字符（`;`、`$()` 等）直接拒绝。
+- 明确敲的 `/docker restart <容器>`、`/esxi on|off|kill <VM>` 和按钮确认流程不变：命令本身就是你明确下的，仍直接执行。
 
 部署在 NAS（ESXi 上的 VM）里的 Docker 容器。经 OpenBox SOCKS5 访问
 Telegram Bot API，长轮询收消息，不需要 webhook，不需要开 inbound 端口，
@@ -33,6 +43,13 @@ Telegram Bot API，长轮询收消息，不需要 webhook，不需要开 inbound
    如果入口设了账号密码，`.env` 里的 `SOCKS_PROXY` 要带上账号密码。
 4. （可选）想用“重启 NAS”按钮：在 `.env` 里填 `NAS_VM_NAME`（NAS 这个
    VM 在 ESXi 里的名字）或 `NAS_VM_ID`。留空则该按钮会提示未配置。
+5. （可选，v2.5.0）想用“系统服务”：二选一——
+   - **SSH（推荐，TrueNAS 26 也能用）**：TrueNAS 网页 → System Settings → Services → SSH → 开启（默认 22 端口）。
+     密钥方式：把私钥放 `./truenas_key`（不要提交），`.env` 里填 `TRUENAS_SSH_KEY_FILE=/keys/truenas_key`；
+     密码方式：`.env` 里填 `TRUENAS_SSH_PASSWORD`（不推荐，密钥优先）。
+   - **API（备用，TrueNAS 26 已移除 REST）**：TrueNAS 网页 → Credentials → API Keys → 新建，
+     `.env` 里填 `TRUENAS_API_URL=https://192.168.124.251/api/v2.0` 和 `TRUENAS_API_KEY`。
+   都不填时，“系统服务”会提示未配置，容器操作不受影响。
 5. （可选）想用“检查更新”从 GitHub 拉新版：在 GitHub 建一个仓库（公开
    或私有都行），根目录放 `bot.py`；`.env` 里填 `UPDATE_REPO`
    （例如 `wdw6733/tg-bot3`），私有仓库再填只读的 `UPDATE_TOKEN`。
