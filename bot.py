@@ -1,30 +1,34 @@
 #!/usr/bin/env python3
-"""3 号机器人：NAS + Docker + ESXi 管理（v2.3.1：命令 + 快捷按钮 + 告警 + 自我更新 + 镜像更新检测）。
+"""3 号机器人：NAS + Docker + ESXi 管理（v2.5.0：内存 TOP5 + 操作授权确认 + TrueNAS 系统服务）。
 
 部署在 NAS（ESXi 上的 VM）里的 Docker 容器中，通过 OpenBox SOCKS5 代理
 访问 Telegram Bot API（长轮询，不需要 webhook、不需要开 inbound 端口）。
 
-- 命令（/status、/docker、/esxi、/disk、/help）和原来一样都能用。
+- 命令（/status、/docker、/esxi、/container_updates、/alerts、/help）都能用。
 - /start 会发主菜单快捷按钮，点按钮直接查 NAS、管容器（本机秒回）。
 - Docker：直接读 /var/run/docker.sock 调 Engine API（不依赖 docker CLI）。
-- NAS 主机状态：读只读挂载的 /host/proc、/host/sys 和 df /host。
+- NAS 主机状态：读只读挂载的 /host/proc、/host/sys 和 df /host；温度/风扇读 ESXi。
 - ESXi：SSH（paramiko）执行 vim-cmd / esxcli。
 - 只认 OWNER_CHAT_ID 一个人；没有任意命令执行功能。
 - 危险操作（停容器、重启容器、关 VM、重启 NAS）要点两次确认。
+- v2.5.0：打字说“内存 TOP5”直接查（只读）；说“重启 X”先报计划，点 ✅ 才执行，5 分钟过期；
+  TrueNAS 系统服务（ssh/cifs/nfs 等）走 NAS 主机 SSH 的 midclt，名字先对实时服务列表校验，
+  不在列表里的不执行；middlewared、docker 等关键服务永不重启。
 - 主动告警：容器意外停了、磁盘/负载/内存超阈值会主动提醒（可关）。
-- 自我更新：GitHub 检查更新或主人发 bot.py 文件，验证后安装重启。
-- 容器更新：拉新镜像并重建，旧容器保留到新容器跑起来后才删。
+- 自我更新：主人发 bot.py 文件，验证后安装重启。
+- 容器更新：拉新镜像并重建，旧容器保留到新容器跑起来后才删；可忽略某次更新。
 - CPU/内存/磁盘用量都用 🟥/🟩 彩条显示；容器管理改成 3 列网格。
 - 容器镜像更新检测：每 6 小时自动检查全部容器，有新镜像就通知，点按钮确认后才更新。
 - 容器/VM 列表按钮文字等宽对齐：名字按显示宽度补齐，同一行 🟢/🔴 圆点横向对齐。
+- 删除容器只删容器本身（docker rm 不带 -v），绝不删数据卷。
 """
 
-import concurrent.futures
-import glob
+import html
 import http.client
 import json
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -62,13 +66,21 @@ ESXI_PASSWORD = os.environ.get("ESXI_PASSWORD", "")
 ESXI_KEY_FILE = os.environ.get("ESXI_KEY_FILE", "").strip()
 NAS_VM_NAME = os.environ.get("NAS_VM_NAME", "").strip()
 NAS_VM_ID = os.environ.get("NAS_VM_ID", "").strip()
-MUSE_BOT_USERNAME = os.environ.get("MUSE_BOT_USERNAME", "MuseAI6_Bot").strip() or "MuseAI6_Bot"
+# TrueNAS 系统服务（v2.5.0）：SSH 优先（midclt），API 备用（REST v2.0，TrueNAS 26 已移除）。
+# 填了 SSH 凭据就用 SSH；只填 API_KEY 就用 API；都没填则系统服务功能提示未配置。
+TRUENAS_HOST = os.environ.get("TRUENAS_HOST", "192.168.124.251").strip()
+TRUENAS_SSH_PORT = _env_int("TRUENAS_SSH_PORT", 22)
+TRUENAS_SSH_USER = os.environ.get("TRUENAS_SSH_USER", "root").strip()
+TRUENAS_SSH_PASSWORD = os.environ.get("TRUENAS_SSH_PASSWORD", "").strip()
+TRUENAS_SSH_KEY_FILE = os.environ.get("TRUENAS_SSH_KEY_FILE", "").strip()
+TRUENAS_API_URL = os.environ.get("TRUENAS_API_URL", "").strip().rstrip("/")
+TRUENAS_API_KEY = os.environ.get("TRUENAS_API_KEY", "").strip()
 _HOST_DATA_PATHS_RAW = os.environ.get("HOST_DATA_PATHS", "").strip()
 # 留空默认看 /mnt/PT 和 /mnt/Strongge（NAS 的两个数据目录）；.env 里填了就按填的来。
 HOST_DATA_PATHS = [p.strip() for p in _HOST_DATA_PATHS_RAW.split(",") if p.strip()] or ["/mnt/PT", "/mnt/Strongge"]
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
-BOT_VERSION = "2.3.1"
+BOT_VERSION = "2.5.0"
 SELF_CONTAINER_NAME = os.environ.get("SELF_CONTAINER_NAME", "tg-bot3").strip() or "tg-bot3"
 ALERT_ENABLED_DEFAULT = os.environ.get("ALERT_ENABLED", "1").strip() not in ("0", "false", "no")
 ALERT_INTERVAL_SEC = _env_int("ALERT_INTERVAL_SEC", 300)
@@ -76,9 +88,6 @@ ALERT_DISK_PCT = _env_float("ALERT_DISK_PCT", 90)
 ALERT_LOAD_MULT = _env_float("ALERT_LOAD_MULT", 2.0)
 ALERT_MEM_PCT = _env_float("ALERT_MEM_PCT", 92)
 ALERT_COOLDOWN_SEC = _env_int("ALERT_COOLDOWN_SEC", 3600)
-UPDATE_REPO = os.environ.get("UPDATE_REPO", "").strip()
-UPDATE_BRANCH = os.environ.get("UPDATE_BRANCH", "main").strip() or "main"
-UPDATE_TOKEN = os.environ.get("UPDATE_TOKEN", "").strip()
 IMAGE_CHECK_ENABLED = os.environ.get("IMAGE_CHECK_ENABLED", "1").strip() not in ("0", "false", "no")
 IMAGE_CHECK_INTERVAL_SEC = _env_int("IMAGE_CHECK_INTERVAL_SEC", 21600)
 
@@ -121,10 +130,17 @@ def bar(pct, width=10):
 
 
 def color_bar(pct, width=10):
-    """磁盘用量彩条：🟥 已用，🟩 未用（TG 消息没有文字颜色，只能用色块）。"""
+    """用量柱状条：单色填充 + 白色留白，填充色按阈值变（<70% 绿，70–90% 橙，>=90% 红），
+    填充与留白对比明显，一眼能看出用了多少。TG 消息没有文字颜色，只能用色块。"""
     pct = max(0.0, min(100.0, float(pct)))
-    used = max(0, min(width, int(pct / 100.0 * width + 0.5)))
-    return "🟥" * used + "🟩" * (width - used)
+    filled = max(0, min(width, int(pct / 100.0 * width + 0.5)))
+    if pct >= 90:
+        fill = "🟥"
+    elif pct >= 70:
+        fill = "🟧"
+    else:
+        fill = "🟩"
+    return fill * filled + "⬜" * (width - filled)
 
 
 def truncate(text, limit=3800):
@@ -143,7 +159,7 @@ def tg_call(method, payload, timeout=60):
     return data["result"]
 
 
-def send_reply(chat_id, text, reply_to=None, reply_markup=None):
+def send_reply(chat_id, text, reply_to=None, reply_markup=None, parse_mode=None):
     chunks = []
     rest = text
     while len(rest) > MAX_REPLY:
@@ -158,6 +174,8 @@ def send_reply(chat_id, text, reply_to=None, reply_markup=None):
         chunks = [""]
     for i, chunk in enumerate(chunks):
         payload = {"chat_id": chat_id, "text": chunk}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         if reply_to and i == 0:
             payload["reply_parameters"] = {"message_id": reply_to}
         if reply_markup and i == 0:
@@ -165,9 +183,11 @@ def send_reply(chat_id, text, reply_to=None, reply_markup=None):
         tg_call("sendMessage", payload)
 
 
-def edit_message(chat_id, message_id, text, reply_markup=None):
+def edit_message(chat_id, message_id, text, reply_markup=None, parse_mode=None):
     payload = {"chat_id": chat_id, "message_id": message_id,
                "text": truncate(text, 4000)}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     try:
@@ -485,7 +505,7 @@ def _update_container_inner(query):
     name = container_display_name(c)
     cid = c["Id"]
     if name == SELF_CONTAINER_NAME:
-        return False, "3 号自己不能用这种方式更新，请用主菜单的“检查更新”。"
+        return False, "3 号自己不能用这种方式更新：把新版 bot.py 文件发给我，我验证后问你装不装。"
     image_ref = (c.get("Image") or "").strip()
     if not image_ref:
         return False, "读不到该容器的镜像名，无法更新。"
@@ -593,56 +613,6 @@ def update_container_async(query, chat_id):
         except Exception as e:
             log("update result send failed:", e)
     threading.Thread(target=_run, daemon=True).start()
-
-
-def fmt_containers():
-    items = list_containers()
-    lines = []
-    for c in items:
-        lines.append(f"{container_display_name(c)} | {c.get('Image', '?')} | {c.get('State', '?')} {c.get('Status', '')}")
-    return "\n".join(lines) if lines else "没有容器。"
-
-
-def calc_cpu_percent(stats):
-    try:
-        cpu = stats.get("cpu_stats", {}) or {}
-        pre = stats.get("precpu_stats", {}) or {}
-        cpu_delta = (cpu.get("cpu_usage", {}) or {}).get("total_usage", 0) - (pre.get("cpu_usage", {}) or {}).get("total_usage", 0)
-        sys_delta = cpu.get("system_cpu_usage", 0) - pre.get("system_cpu_usage", 0)
-        percpu = (cpu.get("cpu_usage", {}) or {}).get("percpu_usage") or []
-        ncpu = len(percpu) or cpu.get("online_cpus") or 1
-        if sys_delta > 0 and cpu_delta >= 0:
-            return cpu_delta / sys_delta * ncpu * 100.0
-    except Exception:
-        pass
-    return 0.0
-
-
-def _one_container_stats(c):
-    try:
-        stats = docker_json("GET", f"/containers/{c['Id']}/stats?stream=0&one-shot=1", timeout=10)
-    except Exception:
-        return None
-    mem = stats.get("memory_stats", {}) or {}
-    usage = mem.get("usage", 0) or 0
-    cache = (mem.get("stats", {}) or {}).get("cache", 0) or 0
-    used = usage - cache if usage >= cache else usage
-    return {"name": container_display_name(c),
-            "cpu": calc_cpu_percent(stats),
-            "mem_used": used, "mem_limit": mem.get("limit", 0) or 0}
-
-
-def container_stats_all():
-    items = [c for c in list_containers() if c.get("State") == "running"]
-    if not items:
-        return []
-    results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        for r in pool.map(_one_container_stats, items):
-            if r is not None:
-                results.append(r)
-    results.sort(key=lambda r: r["cpu"], reverse=True)
-    return results
 
 
 # ---------------- NAS 主机状态 ----------------
@@ -763,99 +733,63 @@ def disk_usages():
     return out
 
 
+def _net_rates():
+    """1 秒采样网卡速率。返回 [(网卡, 累计下行字节, 累计上行字节, 下行速率, 上行速率)]。"""
+    first = _read_net_dev()
+    if not first:
+        return []
+    time.sleep(1.0)
+    second = _read_net_dev()
+    rows = []
+    for iface, (rx2, tx2) in second.items():
+        if iface == "lo":
+            continue
+        rx1, tx1 = first.get(iface, (rx2, tx2))
+        rows.append((iface, rx2, tx2, max(0, rx2 - rx1), max(0, tx2 - tx1)))
+    rows.sort(key=lambda r: r[1] + r[2], reverse=True)
+    return rows
+
+
 def fmt_status():
-    lines = [f"💻 NAS 状态（{cst_now()}）"]
+    lines = [f"💻 NAS 状态 · {cst_now()}"]
+    up = _uptime_text()
+    if up:
+        lines.append(f"⏱ 已运行：{up}")
     cpu = cpu_percent()
     if cpu is not None:
-        lines.append(f"CPU：{color_bar(cpu)} {cpu:.0f}%")
+        lines.append(f"🖥️ CPU：{color_bar(cpu)} {cpu:.0f}%")
     load = _loadavg()
     if load:
-        lines.append(f"负载 1/5/15 分钟：{' / '.join(load)}（{_cpu_count()} 线程）")
+        lines.append(f"📊 负载：{' / '.join(load)}（{_cpu_count()} 线程）")
     mem = _meminfo()
     if mem.get("MemTotal"):
         total = mem["MemTotal"]
         avail = mem.get("MemAvailable", 0)
         used = total - avail
         pct = used / total * 100.0 if total else 0.0
-        lines.append(f"内存：{color_bar(pct)} {fmt_gib_from_kib(used)} / {fmt_gib_from_kib(total)}（{pct:.0f}%）")
+        lines.append(f"🧠 内存：{color_bar(pct)} {pct:.0f}% · {fmt_gib_from_kib(used)} / {fmt_gib_from_kib(total)}")
         if mem.get("SwapTotal"):
             swap_used = mem["SwapTotal"] - mem.get("SwapFree", 0)
-            lines.append(f"交换：{fmt_gib_from_kib(swap_used)} / {fmt_gib_from_kib(mem['SwapTotal'])}")
-    up = _uptime_text()
-    if up:
-        lines.append(f"已运行：{up}")
+            lines.append(f"🔀 交换：{fmt_gib_from_kib(swap_used)} / {fmt_gib_from_kib(mem['SwapTotal'])}")
     for d in disk_usages():
         mount = d["mount"]
         label = mount[5:] if mount.startswith("/host") and len(mount) > 5 else "根分区"
         if mount == "/host":
             label = "根分区"
-        lines.append(f"磁盘 {label}：{color_bar(d['pct'])} {d['pct']:.0f}%（剩 {d['avail']} / 共 {d['size']}）")
+        lines.append(f"💾 {label}：{color_bar(d['pct'])} {d['pct']:.0f}% · 剩 {d['avail']} / 共 {d['size']}")
+    for iface, rx, tx, rx_rate, tx_rate in _net_rates()[:3]:
+        lines.append(f"🌍 {iface}：↓ {human_bytes(rx_rate)}/s ↑ {human_bytes(tx_rate)}/s · 累计 ↓ {human_bytes(rx)} ↑ {human_bytes(tx)}")
+    temps, fans = esxi_temperature()
+    if temps:
+        lines.append("🌡️ ESXi 温度：" + " · ".join(f"{label} {v:.1f}°C" for label, v in temps[:4]))
+    if fans:
+        lines.append("🌀 ESXi 风扇：" + " · ".join(f"{label} {v:.0f} RPM" for label, v in fans[:4]))
     try:
         items = list_containers()
         running = sum(1 for c in items if c.get("State") == "running")
-        lines.append(f"容器：运行 {running} / 共 {len(items)}")
+        lines.append(f"🐳 容器：运行 {running} / 共 {len(items)}")
     except Exception as e:
         lines.append(f"容器：查不到（{e}）")
-    return "\n".join(lines)
-
-
-def host_stats():
-    """旧 /status 的纯文本汇总（保留给 /disk 拆分用，显示已改用 fmt_status）。"""
-    return fmt_status()
-
-
-def disk_text():
-    usages = disk_usages()
-    if not usages:
-        try:
-            r = subprocess.run(["df", "-h", "/host"], capture_output=True, text=True, timeout=10)
-            return "💾 磁盘空间\n" + r.stdout.strip()
-        except (OSError, subprocess.SubprocessError) as e:
-            return f"磁盘读不到：{e}"
-    lines = ["💾 磁盘空间"]
-    for d in usages:
-        mount = d["mount"]
-        label = mount[5:] if mount.startswith("/host") and len(mount) > 5 else mount
-        if mount == "/host":
-            label = "/（根分区）"
-        lines.append(f"{label}\n{color_bar(d['pct'])} {d['pct']:.0f}%  已用 {d['used']} / 剩 {d['avail']} / 共 {d['size']}")
-    return "\n".join(lines)
-
-
-def temp_text():
-    readings = []
-    for type_path in glob.glob("/host/sys/class/thermal/thermal_zone*/type"):
-        zone = os.path.dirname(type_path)
-        temp_path = os.path.join(zone, "temp")
-        label = (_read_text(type_path) or "").strip()
-        raw = (_read_text(temp_path) or "").strip()
-        try:
-            val = int(raw)
-        except ValueError:
-            continue
-        readings.append((label or os.path.basename(zone), val / 1000.0))
-    for name_path in glob.glob("/host/sys/class/hwmon/hwmon*/name"):
-        hwmon = os.path.dirname(name_path)
-        chip = (_read_text(name_path) or "").strip()
-        for input_path in sorted(glob.glob(os.path.join(hwmon, "temp*_input"))):
-            base = input_path[:-len("_input")]
-            label_path = base + "_label"
-            label = (_read_text(label_path) or "").strip()
-            raw = (_read_text(input_path) or "").strip()
-            try:
-                val = int(raw)
-            except ValueError:
-                continue
-            name = f"{chip} {label}".strip() if label else chip
-            readings.append((name or os.path.basename(hwmon), val / 1000.0))
-    if not readings:
-        return ("🌡️ 温度\nVM 内读不到温度传感器。NAS 是 ESXi 上的虚拟机，传感器一般不直通进 VM；"
-                "温度请看 ESXi 主机或 TrueNAS 界面。")
-    lines = ["🌡️ 温度"]
-    for label, celsius in readings[:12]:
-        lines.append(f"{label}：{celsius:.1f}°C")
-    if len(readings) > 12:
-        lines.append(f"…还有 {len(readings) - 12} 个传感器未显示")
     return "\n".join(lines)
 
 
@@ -895,6 +829,7 @@ def _read_procs():
 
 
 def top_text():
+    """进程 TOP：等宽 <pre> 列表（名字 / CPU% / 内存），前 10 名。调用方须用 parse_mode="HTML" 发送。"""
     try:
         clk = os.sysconf("SC_CLK_TCK")
     except (ValueError, OSError):
@@ -914,12 +849,217 @@ def top_text():
         cpu = delta / (elapsed * clk) * 100.0 if delta > 0 else 0.0
         rows.append((cpu, rss, pid, name))
     rows.sort(reverse=True)
-    lines = ["⬆️ 进程 TOP（按 CPU，1 秒采样）"]
-    for cpu, rss, pid, name in rows[:10]:
-        short = name if len(name) <= 18 else name[:17] + "…"
-        lines.append(f"{pid} {short}  CPU {cpu:.1f}%  内存 {human_bytes(rss * 1024)}")
+    lines = ["⬆️ 进程 TOP（按 CPU，1 秒采样）", "<pre>"]
+    lines.append(f"{'NAME':<18}{'CPU%':>7}{'MEM':>9}")
+    for cpu, rss, _pid, name in rows[:10]:
+        lines.append(f"{html.escape(pad_name(name, 18))}{cpu:>6.1f}%{human_bytes(rss * 1024):>9}")
+    lines.append("</pre>")
     lines.append(f"共 {len(second)} 个进程")
     return "\n".join(lines)
+
+def top_mem_text():
+    """内存 TOP5：按 VmRSS 从大到小，前 5 名。只读，立即执行，不用确认。"""
+    procs = _read_procs()
+    if not procs:
+        return "进程读不到 /host/proc，请确认 /proc 已挂载到 /host/proc。"
+    rows = sorted(((rss, pid, name) for pid, (name, _j, rss) in procs.items()),
+                  reverse=True)
+    total_kb = sum(rss for rss, _p, _n in rows)
+    lines = ["🧠 内存 TOP5（按 VmRSS）", "<pre>"]
+    lines.append(f"{'NAME':<18}{'MEM':>9}{'SHARE':>7}")
+    for rss, _pid, name in rows[:5]:
+        share = (rss / total_kb * 100.0) if total_kb else 0.0
+        lines.append(f"{html.escape(pad_name(name, 18))}{human_bytes(rss * 1024):>9}{share:>6.1f}%")
+    lines.append("</pre>")
+    lines.append(f"共 {len(rows)} 个进程，总占用 {human_bytes(total_kb * 1024)}")
+    return "\n".join(lines)
+
+
+# ---------------- TrueNAS 系统服务（v2.5.0） ----------------
+# 目标只能是 TrueNAS 自己的服务（ssh/cifs/nfs/ftp/rsync/smartd/snmp/ups/webdav/s3/iscsi…），
+# 执行前先对实时服务列表校验名字，不在列表里的拒绝；middlewared 永远不碰。
+# 传输：NAS 主机 SSH（midclt call service.*）优先；没配 SSH 才用 REST API
+# （POST {TRUENAS_API_URL}/service/{start|stop|restart} {"service": name}，TrueNAS 26 已移除 REST）。
+
+TRUENAS_BLOCKED_SERVICES = {"middlewared", "docker", "containerd", "systemd-journald"}
+
+
+def truenas_ssh_configured():
+    return bool(TRUENAS_HOST and (TRUENAS_SSH_PASSWORD or TRUENAS_SSH_KEY_FILE))
+
+
+def truenas_api_configured():
+    return bool(TRUENAS_API_URL and TRUENAS_API_KEY)
+
+
+def truenas_configured():
+    return truenas_ssh_configured() or truenas_api_configured()
+
+
+def truenas_ssh_run(commands, connect_timeout=15, exec_timeout=30):
+    import paramiko
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    kw = {"hostname": TRUENAS_HOST, "port": TRUENAS_SSH_PORT, "username": TRUENAS_SSH_USER,
+          "timeout": connect_timeout, "allow_agent": False, "look_for_keys": False}
+    if TRUENAS_SSH_KEY_FILE:
+        kw["key_filename"] = TRUENAS_SSH_KEY_FILE
+    else:
+        kw["password"] = TRUENAS_SSH_PASSWORD
+    client.connect(**kw)
+    try:
+        results = []
+        for cmd in commands:
+            _, stdout, stderr = client.exec_command(cmd, timeout=exec_timeout)
+            results.append((stdout.read().decode("utf-8", errors="replace"),
+                            stderr.read().decode("utf-8", errors="replace")))
+        return results
+    finally:
+        client.close()
+
+
+def truenas_services():
+    """实时服务列表：[(name, state)]。SSH 的 midclt 优先，API 备用。"""
+    if truenas_ssh_configured():
+        out, err = truenas_ssh_run(["midclt call service.query"])[0]
+        if err.strip():
+            raise RuntimeError(f"midclt 报错：{err.strip()[:200]}")
+        items = json.loads(out)
+        return [(str(i.get("service", "")), str(i.get("state", "?"))) for i in items if i.get("service")]
+    if truenas_api_configured():
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        r = requests.get(f"{TRUENAS_API_URL}/service", timeout=20,
+                         headers={"Authorization": f"Bearer {TRUENAS_API_KEY}"}, verify=False)
+        if r.status_code == 404:
+            raise RuntimeError("TrueNAS API 返回 404：这台 NAS 的版本已移除 REST v2.0，请改用 SSH 方式。")
+        r.raise_for_status()
+        items = r.json()
+        return [(str(i.get("service", "")), str(i.get("state", "?"))) for i in items if i.get("service")]
+    raise RuntimeError("TrueNAS 未配置：在 .env 里填 TRUENAS_SSH_KEY_FILE/TRUENAS_SSH_PASSWORD 或 TRUENAS_API_KEY 后重启容器。")
+
+
+def truenas_service_action(name, action):
+    """校验名字在实时列表里、动作合法、不是禁区服务，才执行。返回执行结果文字。"""
+    if action not in ("start", "stop", "restart"):
+        raise ValueError(f"不支持的操作：{action}")
+    name = (name or "").strip().lower()
+    if not name or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
+        raise ValueError(f"服务名不合法：{name!r}")
+    if name in TRUENAS_BLOCKED_SERVICES:
+        raise ValueError(f"服务 {name} 是关键服务，不允许经机器人重启/启停。")
+    services = truenas_services()
+    known = {n for n, _s in services}
+    if name not in known:
+        raise ValueError(f"没有这个服务：{name}。发“系统服务”看实时列表。")
+    label = {"start": "启动", "stop": "停止", "restart": "重启"}[action]
+    if truenas_ssh_configured():
+        out, err = truenas_ssh_run([f"midclt call service.{action} {name}"])[0]
+        if err.strip():
+            raise RuntimeError(f"midclt 报错：{err.strip()[:200]}")
+        ok = out.strip().lower() in ("true", "1")
+        return f"✅ {label}服务 {name}：{'成功' if ok else '返回 ' + out.strip()[:100]}"
+    # API 备用
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    r = requests.post(f"{TRUENAS_API_URL}/service/{action}", timeout=30,
+                      headers={"Authorization": f"Bearer {TRUENAS_API_KEY}"},
+                      json={"service": name}, verify=False)
+    if r.status_code == 404:
+        raise RuntimeError("TrueNAS API 返回 404：这台 NAS 的版本已移除 REST v2.0，请改用 SSH 方式。")
+    r.raise_for_status()
+    return f"✅ {label}服务 {name}：成功"
+
+
+def truenas_services_text():
+    try:
+        services = truenas_services()
+    except Exception as e:
+        return f"系统服务查不到：{e}"
+    lines = ["🖥️ TrueNAS 系统服务（实时）"]
+    for name, state in sorted(services):
+        dot = "🟢" if state.upper() == "RUNNING" else "🔴"
+        lines.append(f"{dot} {name} {state}")
+    lines.append(f"\n共 {len(services)} 个。说“重启 <服务名>”会先让你点 ✅ 确认再执行。")
+    return "\n".join(lines)
+
+
+# ---------------- 操作授权确认（v2.5.0） ----------------
+# 打字发起的操作（意图可能被理解错）必须先报计划、点 ✅ 才执行；明确敲的 /docker、/esxi
+# 命令和按钮里的 c:ask:/e:ask: 本来就是主人明确点的，走各自原有的确认流程。
+# 待确认的操作只存内存，5 分钟过期，重启容器即作废；token 是随机数，猜不到。
+
+_PENDING_OPS = {}
+_OP_TTL_SEC = 300
+_OP_LABEL = {"start": "启动", "stop": "停止", "restart": "重启"}
+
+
+def request_op_approval(chat_id, message_id, kind, target, action, detail):
+    token = secrets.token_hex(4)
+    _PENDING_OPS[token] = (kind, target, action, time.monotonic() + _OP_TTL_SEC)
+    label = _OP_LABEL.get(action, action)
+    kind_label = {"container": "容器", "service": "系统服务", "esxi": "VM"}.get(kind, kind)
+    send_reply(chat_id,
+               f"⚠️ 确定要{label}{kind_label}“{target}”吗？\n{detail}\n"
+               f"点 ✅ 才执行，❌ 取消；5 分钟内有效，超时作废。",
+               reply_to=message_id,
+               reply_markup=confirm_keyboard(f"op:do:{token}", f"op:cancel:{token}"))
+    return token
+
+
+def _take_pending_op(token):
+    item = _PENDING_OPS.pop(token, None)
+    if not item:
+        return None
+    kind, target, action, expiry = item
+    if time.monotonic() > expiry:
+        return None
+    return kind, target, action
+
+
+def execute_pending_op(token):
+    """执行已确认的操作，返回结果文字。token 已在 _take_pending_op 里消费掉。"""
+    item = _take_pending_op(token)
+    if item is None:
+        raise ValueError("这条确认已过期或已执行过，请重新发一次操作请求。")
+    kind, target, action = item
+    label = _OP_LABEL.get(action, action)
+    if kind == "container":
+        c = container_action(target, action)
+        return f"✅ {label}已执行：{container_display_name(c)}"
+    if kind == "service":
+        return truenas_service_action(target, action)
+    if kind == "esxi":
+        v, out = esxi_power(target, action)
+        return f"{v['name']}（{v['vmid']}）{label}：{out or '命令已发送'}"
+    raise ValueError(f"未知的操作类型：{kind}")
+
+
+_OP_WORDS = (("重启", "restart"), ("restart", "restart"),
+             ("停止", "stop"), ("停掉", "stop"), ("关闭", "stop"), ("stop", "stop"),
+             ("启动", "start"), ("开启", "start"), ("start", "start"))
+
+
+def parse_op_request(text):
+    """从一句话里解析（动作，目标），解析不出返回 (None, None)。只认固定动作词，目标只取一个词。"""
+    low = text.strip().lower()
+    action = None
+    for word, act in _OP_WORDS:
+        if word in low:
+            action = act
+            low = low.replace(word, " ", 1)
+            break
+    if not action:
+        return None, None
+    for junk in ("请", "帮我", "把", "一下", "吧", "的", "给", "要", "想", "需要"):
+        low = low.replace(junk, " ")
+    parts = [p for p in re.split(r"[\s,，。、]+", low) if p]
+    if not parts:
+        return None, None
+    target = parts[0]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", target):
+        return None, None
+    return action, target
 
 
 def _read_net_dev():
@@ -940,30 +1080,6 @@ def _read_net_dev():
         except ValueError:
             continue
     return out
-
-
-def net_text():
-    first = _read_net_dev()
-    if not first:
-        return "网络读不到 /host/proc/net/dev。"
-    t0 = time.monotonic()
-    time.sleep(1.0)
-    second = _read_net_dev()
-    elapsed = max(0.1, time.monotonic() - t0)
-    rows = []
-    for iface, (rx2, tx2) in second.items():
-        if iface == "lo":
-            continue
-        rx1, tx1 = first.get(iface, (rx2, tx2))
-        rows.append((rx2 + tx2, iface, rx2, tx2,
-                     max(0, rx2 - rx1) / elapsed, max(0, tx2 - tx1) / elapsed))
-    rows.sort(reverse=True)
-    lines = ["🌍 网络流量（速率按 1 秒采样）"]
-    for _total, iface, rx, tx, rx_rate, tx_rate in rows[:8]:
-        lines.append(f"{iface}\n  下行 {human_bytes(rx)}（{human_bytes(rx_rate)}/s） 上行 {human_bytes(tx)}（{human_bytes(tx_rate)}/s）")
-    if not rows:
-        lines.append("没有除 lo 以外的网卡数据。")
-    return "\n".join(lines)
 
 
 def _fetch_ip(url, use_proxy):
@@ -1136,11 +1252,11 @@ def esxi_configured():
     return bool(ESXI_HOST and (ESXI_PASSWORD or ESXI_KEY_FILE))
 
 
-def esxi_run(commands):
+def esxi_run(commands, connect_timeout=15, exec_timeout=30):
     import paramiko
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    kw = {"hostname": ESXI_HOST, "username": ESXI_USER, "timeout": 15,
+    kw = {"hostname": ESXI_HOST, "username": ESXI_USER, "timeout": connect_timeout,
           "allow_agent": False, "look_for_keys": False}
     if ESXI_KEY_FILE:
         kw["key_filename"] = ESXI_KEY_FILE
@@ -1150,12 +1266,71 @@ def esxi_run(commands):
     try:
         results = []
         for cmd in commands:
-            _, stdout, stderr = client.exec_command(cmd, timeout=30)
+            _, stdout, stderr = client.exec_command(cmd, timeout=exec_timeout)
             results.append((stdout.read().decode("utf-8", errors="replace"),
                             stderr.read().decode("utf-8", errors="replace")))
         return results
     finally:
         client.close()
+
+
+def esxi_temperature():
+    """从 ESXi 读温度/风扇（esxcli hardware ipmi sensor list）。
+
+    返回 (temps, fans)，各为 [(标签, 数值)]；温度单位 °C，风扇单位 RPM。
+    ESXi 未配置、命令失败、超时或解析不到读数时返回 ([], [])，
+    调用方直接不显示温度段，绝不显示残缺内容。
+    """
+    if not esxi_configured():
+        return [], []
+    try:
+        (out, _err) = esxi_run(["esxcli hardware ipmi sensor list"],
+                               connect_timeout=5, exec_timeout=10)[0]
+    except Exception as e:
+        log("ESXi 温度读取失败：", e)
+        return [], []
+    temps, fans = [], []
+    cur = {}
+
+    def flush():
+        nonlocal cur
+        name = (cur.get("name") or "").strip()
+        reading = cur.get("reading")
+        units = (cur.get("units") or "").strip().lower()
+        stype = (cur.get("type") or "").strip().lower()
+        cur = {}
+        if not name or reading is None:
+            return
+        try:
+            val = float(reading)
+        except ValueError:
+            return
+        if "rpm" in units or "fan" in stype or "fan" in name.lower():
+            fans.append((name, val))
+        elif "c" in units or "temperature" in stype or "temp" in name.lower():
+            temps.append((name, val))
+
+    for line in out.splitlines():
+        s = line.strip()
+        if line and not line[0].isspace() and s.lower().startswith("sensor"):
+            flush()
+            continue
+        if ":" not in s:
+            continue
+        key, _, val = s.partition(":")
+        key = key.strip().lower()
+        val = val.strip()
+        if key == "name":
+            flush()
+            cur["name"] = val
+        elif key == "reading":
+            cur["reading"] = val
+        elif key in ("base units", "units"):
+            cur["units"] = val
+        elif key == "sensor type":
+            cur["type"] = val
+    flush()
+    return temps, fans
 
 
 VM_LINE = re.compile(r"^(\d+)\s+(.+?)\s+\[([^\]]+)\]")
@@ -1231,32 +1406,6 @@ def parse_version(s):
 def extract_version(source_text):
     m = re.search(r"^BOT_VERSION\s*=\s*[\"']([^\"']+)[\"']", source_text, re.M)
     return m.group(1) if m else None
-
-
-def _http_get_bytes(url, headers=None):
-    """先直连，失败再走 SOCKS 代理。404 返回 None，其他失败抛错。"""
-    last_err = None
-    direct = requests.Session()
-    direct.trust_env = False
-    direct.proxies = {}
-    for sess, timeout in ((direct, 20), (session, 30)):
-        try:
-            resp = sess.get(url, headers=headers or {}, timeout=timeout)
-            if resp.status_code == 404:
-                return None
-            resp.raise_for_status()
-            return resp.content
-        except Exception as e:
-            last_err = e
-    raise RuntimeError(f"下载失败：{last_err}")
-
-
-def fetch_github_file(repo, branch, path):
-    url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
-    headers = {"User-Agent": "tg-bot3-selfupdate"}
-    if UPDATE_TOKEN:
-        headers["Authorization"] = f"token {UPDATE_TOKEN}"
-    return _http_get_bytes(url, headers)
 
 
 def _smoke_test_candidate(path):
@@ -1340,18 +1489,6 @@ def _clear_staging():
             pass
 
 
-def _is_mounted(path):
-    try:
-        with open("/proc/mounts", encoding="utf-8") as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) >= 2 and parts[1] == path:
-                    return True
-    except OSError:
-        pass
-    return False
-
-
 def self_container_ok():
     """确认能通过 Docker API 找到并重启自己；找不到就拒绝自我更新。"""
     try:
@@ -1362,63 +1499,12 @@ def self_container_ok():
         return False
 
 
-def check_github_update():
-    """返回 (text, reply_markup)。有新版本时把候选文件写入 staging，等待确认安装。"""
-    if not UPDATE_REPO:
-        return ("🔄 自我更新未配置。\n\n"
-                "要在 .env 里填 UPDATE_REPO（例如 wdw6733/tg-bot3，仓库根目录放 bot.py），"
-                "私有仓库再填 UPDATE_TOKEN（只读）。填好后重启容器，这个按钮才能检查更新。\n\n"
-                "也可以直接把新版 bot.py 文件发给 3 号，我验证后问你装不装。"), back_keyboard()
-    if not self_container_ok():
-        return (f"自我更新不可用：Docker 里找不到名为 {SELF_CONTAINER_NAME} 的容器，"
-                "无法重启自己。请检查 compose 里的 container_name 和 .env 的 SELF_CONTAINER_NAME。"), back_keyboard()
-    try:
-        raw = fetch_github_file(UPDATE_REPO, UPDATE_BRANCH, "bot.py")
-    except Exception as e:
-        return f"检查更新失败：{e}", back_keyboard()
-    if raw is None:
-        return f"仓库 {UPDATE_REPO} 的 {UPDATE_BRANCH} 分支下找不到 bot.py。", back_keyboard()
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return "仓库里的 bot.py 不是 UTF-8 文本，无法更新。", back_keyboard()
-    version = extract_version(text)
-    if not version:
-        return "仓库里的 bot.py 找不到版本号，无法更新。", back_keyboard()
-    if parse_version(version) <= parse_version(BOT_VERSION):
-        return f"✅ 已是最新版：当前 v{BOT_VERSION}，仓库 v{version}。", back_keyboard()
-    try:
-        req_raw = fetch_github_file(UPDATE_REPO, UPDATE_BRANCH, "requirements.txt")
-    except Exception as e:
-        return f"检查更新失败（requirements.txt 拉不到）：{e}", back_keyboard()
-    if req_raw is not None:
-        try:
-            with open(os.path.join(_app_dir(), "requirements.txt"), "rb") as f:
-                local_req = f.read()
-        except OSError:
-            local_req = b""
-        if req_raw.strip() != local_req.strip():
-            return (f"仓库有新版 v{version}，但 requirements.txt 变了，需要重新构建镜像，"
-                    "自我更新装不了。请手动部署新版。"), back_keyboard()
-    _save_staging_meta({"version": version, "source": f"github:{UPDATE_REPO}@{UPDATE_BRANCH}",
-                        "saved_at": time.time()})
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(os.path.join(DATA_DIR, "update_candidate.py"), "wb") as f:
-        f.write(raw)
-    mount_note = "" if _is_mounted(_app_file()) else "\n⚠️ 未检测到 bot.py 文件挂载：更新能生效，但下次重建镜像后会丢，请按 README 给 compose 加上 bot.py 挂载。"
-    return (f"🔄 发现新版：v{BOT_VERSION} → v{version}\n"
-            f"来源：{UPDATE_REPO}@{UPDATE_BRANCH}（{len(raw)} 字节）\n"
-            "安装前会先做语法与冒烟验证，旧版会备份到 data/bot.py.bak。点确定后机器人会重启，"
-            "重启成功后会发消息确认。" + mount_note,
-            confirm_keyboard("menu:update_do", "menu:main", "✅ 确认更新"))
-
-
 def install_staged_update():
     """验证 staging 里的候选文件并安装。返回 (ok, version_or_error)。成功后调用方负责重启。"""
     meta = _load_staging_meta()
     staging = os.path.join(DATA_DIR, "update_candidate.py")
     if not meta or not os.path.exists(staging):
-        return False, "没有待安装的更新，请先检查更新或发文件。"
+        return False, "没有待安装的更新，请先发新版 bot.py 文件。"
     if time.time() - float(meta.get("saved_at", 0)) > 1800:
         _clear_staging()
         return False, "待安装的更新已过期（超过 30 分钟），请重新检查更新。"
@@ -1462,32 +1548,6 @@ def restart_self_delayed():
         time.sleep(2)
         restart_self()
     threading.Thread(target=_run, daemon=True).start()
-
-
-def announce_pending_update():
-    """启动后如果有刚安装的更新，发消息确认版本；版本没变则警告挂载问题。"""
-    meta = _load_staging_meta()
-    if not meta or not meta.get("installed"):
-        return
-    version = meta.get("version", "?")
-    try:
-        os.remove(_staging_meta_path())
-    except OSError:
-        pass
-    try:
-        os.remove(os.path.join(DATA_DIR, "update_candidate.py"))
-    except OSError:
-        pass
-    if parse_version(BOT_VERSION) >= parse_version(version):
-        text = f"✅ 更新完成：当前版本 v{BOT_VERSION}（来源：{meta.get('source', '?')}）。"
-    else:
-        text = (f"⚠️ 重启后版本仍是 v{BOT_VERSION}，没有变成 v{version}。"
-                "可能是 bot.py 挂载没生效。请检查 compose 里的 bot.py 挂载，"
-                "或用 data/bot.py.bak 恢复旧版后手动部署。")
-    try:
-        send_reply(OWNER_CHAT_ID, text, reply_markup=main_keyboard())
-    except Exception as e:
-        log("announce update failed:", e)
 
 
 def handle_document_update(msg):
@@ -1535,10 +1595,6 @@ def btn(text, data):
     return {"text": text, "callback_data": data}
 
 
-def url_btn(text, url):
-    return {"text": text, "url": url}
-
-
 def kb(rows):
     return {"inline_keyboard": rows}
 
@@ -1561,10 +1617,15 @@ def _load_image_check_state():
             state = json.load(f)
         if isinstance(state, dict):
             state.setdefault("notified", {})
+            state.setdefault("ignored", {})
             return state
     except (OSError, ValueError):
         pass
-    return {"notified": {}}
+    return {"notified": {}, "ignored": {}}
+
+
+# 最近一次镜像检查的完整结果（内存里，供“忽略/恢复”按钮点完后重绘报告用）。
+_LAST_IMAGE_CHECK_RESULTS = []
 
 
 def _save_image_check_state(state):
@@ -1626,32 +1687,68 @@ def check_container_image_updates():
     return results
 
 
+def _short_id(image_id):
+    """sha256:xxx… 截成短 id 方便看。"""
+    if not image_id:
+        return "?"
+    if image_id.startswith("sha256:"):
+        return image_id[7:19]
+    return image_id[:12]
+
+
+def _is_ignored(ignored, result):
+    """这条更新是否已被忽略（只忽略这一个镜像版本；出了更新的版本会再提醒）。"""
+    entry = (ignored or {}).get(result.get("cid", ""))
+    return bool(entry) and entry.get("new_id") == result.get("new_id")
+
+
 def format_image_check_report(results):
-    """检查结果文本 + 键盘（每个有更新的容器一个确认按钮）。"""
-    updates = [r for r in results if r["status"] == "update"]
+    """检查结果文本 + 键盘。
+
+    每个有更新的容器一行说明 + [⬆️ 升级] [🚫 忽略] 两个按钮；
+    已忽略的单独列在下面，可点 [↩️ 恢复]。
+    """
+    state = _load_image_check_state()
+    ignored = state.get("ignored", {})
+    updates = [r for r in results if r["status"] == "update" and not _is_ignored(ignored, r)]
+    ignored_rows = [r for r in results if r["status"] == "update" and _is_ignored(ignored, r)]
     current = sum(1 for r in results if r["status"] == "current")
     problems = [r for r in results if r["status"] in ("error", "skipped")]
-    lines = [f"🔍 容器镜像更新检查（{cst_now()}）"]
+    lines = [f"🔍 容器更新（{cst_now()}）"]
     if updates:
         lines.append("")
         for r in updates:
             lines.append(f"⬆️ {r['name']}（{r['image']}）有新镜像")
+            lines.append(f"   旧：{_short_id(r.get('old_id', ''))} → 新：{_short_id(r.get('new_id', ''))}")
+    elif ignored_rows:
+        lines.append("\n没有新的更新（有更新的都已忽略）。")
     else:
         lines.append("\n全部容器都已是最新。")
-    lines.append(f"\n共 {len(results)} 个容器：{len(updates)} 个有更新，{current} 个已是最新，{len(problems)} 个检查失败/跳过。")
+    lines.append(f"\n共 {len(results)} 个容器：{len(updates)} 个有更新，{current} 个已是最新，"
+                 f"{len(problems)} 个检查失败/跳过{'' if not ignored_rows else f'，{len(ignored_rows)} 个已忽略'}。")
     for r in problems[:5]:
         lines.append(f"⚠️ {r['name']}：{r.get('error', '')[:40]}")
     if len(problems) > 5:
         lines.append(f"…还有 {len(problems) - 5} 个未列出。")
+    if ignored_rows:
+        lines.append("\n🙈 已忽略（出了更新的版本会再提醒）：")
+        for r in ignored_rows:
+            lines.append(f"· {r['name']}（{r['image']}）")
     if updates:
-        lines.append("\n点下面的按钮确认更新哪个，不点就不动。")
-    rows = [[btn(f"⬆️ 更新 {r['name']}", f"c:ask:update:{r['cid'][:12]}")] for r in updates]
+        lines.append("\n点 [⬆️ 升级] 确认更新某个容器，不点就不动；点 [🚫 忽略] 这次就不再提醒。")
+    rows = []
+    for r in updates:
+        rows.append([btn(f"⬆️ 升级 {r['name']}", f"c:ask:update:{r['cid'][:12]}"),
+                     btn("🚫 忽略", f"img:ignore:{r['cid'][:12]}")])
+    for r in ignored_rows:
+        rows.append([btn(f"↩️ 恢复 {r['name']}", f"img:unignore:{r['cid'][:12]}")])
     rows.append([btn("⬅️ 主菜单", "menu:main")])
     return truncate("\n".join(lines)), kb(rows)
 
 
 def run_image_check(manual, chat_id):
     """跑一次全量检查。手动触发总是回报告；自动触发只在有“新”更新时通知。"""
+    global _LAST_IMAGE_CHECK_RESULTS
     results = check_container_image_updates()
     if results and results[0].get("status") == "fatal":
         if manual:
@@ -1659,21 +1756,31 @@ def run_image_check(manual, chat_id):
         else:
             log("镜像更新自动检查失败：", results[0].get("error"))
         return
+    _LAST_IMAGE_CHECK_RESULTS = results
     state = _load_image_check_state()
     notified = state.get("notified", {})
+    ignored = state.get("ignored", {})
     present = {r["cid"] for r in results}
     has_new = False
     for r in results:
         if r["status"] == "update":
+            if _is_ignored(ignored, r):
+                notified.pop(r["cid"], None)
+                continue
             if notified.get(r["cid"]) != r["new_id"]:
                 notified[r["cid"]] = r["new_id"]
                 has_new = True
         elif r["status"] == "current":
             notified.pop(r["cid"], None)
+            ignored.pop(r["cid"], None)
     for cid in list(notified):
         if cid not in present:
             del notified[cid]
+    for cid in list(ignored):
+        if cid not in present:
+            del ignored[cid]
     state["notified"] = notified
+    state["ignored"] = ignored
     state["last_check"] = time.time()
     _save_image_check_state(state)
     if manual or has_new:
@@ -1701,14 +1808,9 @@ def start_image_check(manual, chat_id):
 def main_keyboard():
     return kb([
         [btn("📊 系统状态", "menu:status"), btn("🌐 公网 IP", "menu:ip")],
-        [btn("🐳 容器列表", "menu:containers"), btn("📈 容器资源", "menu:stats")],
-        [btn("💾 磁盘空间", "menu:disk"), btn("🌡️ 温度", "menu:temp")],
-        [btn("⬆️ 进程 TOP", "menu:top"), btn("🌍 网络流量", "menu:net")],
-        [btn("🛠️ 容器管理", "menu:manage:0"), btn("🖥️ ESXi VM", "menu:esxi")],
-        [btn("🔄 重启 NAS", "menu:reboot")],
-        [btn("⬆️ 检查更新", "menu:update"), btn("🔔 告警", "menu:alerts")],
-        [btn("🔍 检查容器更新", "menu:check_updates")],
-        [url_btn("🤖 给 Muse 下指令", f"https://t.me/{MUSE_BOT_USERNAME}")],
+        [btn("⬆️ 进程 TOP", "menu:top"), btn("🛠️ 容器管理", "menu:manage:0")],
+        [btn("🖥️ ESXi VM", "menu:esxi"), btn("🔄 重启 NAS", "menu:reboot")],
+        [btn("🔍 容器更新", "menu:container_updates"), btn("🔔 告警", "menu:alerts")],
     ])
 
 
@@ -1722,35 +1824,28 @@ def refresh_back_keyboard(action_data):
 
 WELCOME = f"""👋 Muse × NAS 控制台（v{BOT_VERSION}）
 
-点下面的按钮就能直接查 NAS、管容器（本机秒回，不用等 Muse）。
-NAS、容器、ESXi 的事都在这里执行，不用去 2 号。
+点下面的按钮就能直接查 NAS、管容器（本机秒回）。
+NAS、容器、ESXi 的事都在这里执行。
 
-生图、生视频、查资料等，点“给 Muse 下指令”去 2 号机器人。
-
-命令也一样能用：/status /docker /esxi /disk /check_updates /help"""
+命令也一样能用：/status /docker /esxi /container_updates /alerts /help"""
 
 
 HELP = """3 号机器人：NAS + Docker + ESXi 管理
 
 发 /start 打开快捷按钮菜单，点按钮就能查 NAS、管容器。
-直接打字说“系统状态”“磁盘空间”等也能查；启停等操作要点按钮确认。
+直接打字说“系统状态”“进程”“内存 TOP5”也能查；说“重启 <容器/服务名>”会先让你点 ✅ 确认再执行。
 
-/status NAS 状态 + 容器 + VM 汇总
-/docker 列出容器
-/docker logs <容器> [行数] [关键词] 看/搜日志
-/docker start|stop|restart <容器>
-/docker prune 清理悬空镜像
-/docker update <容器> 拉新镜像并重建（要点确认）
-/esxi 列出 VM 和电源状态
-/esxi on|off|kill <VM 名或 ID> 开机/优雅关机/强制断电
-/disk 磁盘用量
-/update 检查自我更新
-/check_updates 检查全部容器镜像更新
+/status NAS 状态（CPU/内存/磁盘/网络/ESXi 温度风扇/容器数）
+/docker 打开容器管理（或 logs <容器> [行数] [关键词] | start|stop|restart <容器> | prune | update <容器>）
+/esxi 列出 VM 和电源状态（或 on|off|kill <VM 名或 ID>）
+/container_updates 检查全部容器镜像更新（可忽略、可升级）
+/topmem 内存占用 TOP5（只读）
+/services TrueNAS 系统服务列表（或说“系统服务”）
 /alerts 告警状态（on/off 开关）
 /menu 打开快捷按钮菜单
 /help 帮助
 
-只认主人一个人，没有任意命令执行。危险操作要点两次确认。"""
+只认主人一个人，没有任意命令执行。危险操作要点两次确认。删除容器只删容器本身，不删数据卷。"""
 
 
 # ---------- 按钮文字等宽对齐 ----------
@@ -1872,19 +1967,6 @@ def detail_text_for(c):
         return container_detail_text(c)
 
 
-def stats_text():
-    results = container_stats_all()
-    if not results:
-        return "📈 容器资源\n没有运行中的容器，或资源数据读不到。"
-    lines = ["📈 容器资源（按 CPU 排序）"]
-    for r in results[:15]:
-        mem_pct = r["mem_used"] / r["mem_limit"] * 100.0 if r["mem_limit"] else 0.0
-        lines.append(f"{r['name']}  CPU {r['cpu']:.1f}%  内存 {human_bytes(r['mem_used'])}/{human_bytes(r['mem_limit'])}（{mem_pct:.0f}%）")
-    if len(results) > 15:
-        lines.append(f"…还有 {len(results) - 15} 个容器未显示")
-    return "\n".join(lines)
-
-
 # 日志搜索待输入状态：chat_id -> (shortid, 过期时间戳)
 _PENDING_SEARCH = {}
 
@@ -1930,33 +2012,66 @@ def handle_plain_text(raw, chat_id, message_id):
         send_reply(chat_id, reply, reply_to=message_id, reply_markup=markup)
         return
     text = raw.strip().lower()
+    parse_mode = None
     try:
-        if any(k in text for k in ("重启", "停止", "启动", "关机", "开机", "断电")):
-            reply = ("要执行操作，请点下面的按钮选容器/VM 再点确认，或直接发命令（/docker、/esxi），"
-                     "我直接在 NAS 上执行，不用去 2 号。只看状态的话直接说“系统状态”“磁盘空间”就行。")
-            markup = main_keyboard()
-        elif any(k in text for k in ("检查更新", "镜像更新", "容器更新", "更新容器", "有更新")):
+        if any(k in text.replace(" ", "") for k in ("内存top5", "top5内存", "内存占用", "内存前5", "内存最高")):
+            reply, markup = top_mem_text(), refresh_back_keyboard("menu:top")
+            parse_mode = "HTML"
+        elif any(k in text for k in ("系统服务", "服务列表")):
+            reply, markup = truenas_services_text(), back_keyboard()
+        elif any(k in text for k in ("重启", "停止", "启动", "关机", "开机", "断电")):
+            action, target = parse_op_request(raw)
+            if action and target:
+                # 先看是不是容器，再看是不是系统服务；都不是就报出来，不猜。
+                detail = ""
+                kind = None
+                try:
+                    c = resolve_container(target)
+                    kind, detail = "container", f"容器：{container_display_name(c)}（{c.get('State', '?')}）"
+                except Exception:
+                    kind = None
+                if kind is None and truenas_configured():
+                    try:
+                        names = {n for n, _s in truenas_services()}
+                        if target in names:
+                            kind, detail = "service", f"系统服务：{target}（TrueNAS，{'SSH' if truenas_ssh_configured() else 'API'}）"
+                    except Exception as e:
+                        log("查服务列表失败：", e)
+                if kind is None:
+                    if not truenas_configured():
+                        reply = (f"找不到容器“{target}”，系统服务也没配置。\n"
+                                 "系统服务要在 .env 里填 TRUENAS_SSH_KEY_FILE/TRUENAS_SSH_PASSWORD 或 TRUENAS_API_KEY 后重启容器。")
+                    else:
+                        reply = f"找不到容器或系统服务“{target}”。发“系统服务”看实时列表，或发“容器”看容器列表。"
+                    markup = main_keyboard()
+                else:
+                    request_op_approval(chat_id, message_id, kind, target, action,
+                                        detail + "\n执行前请确认目标没认错。")
+                    return
+            else:
+                reply = ("要执行操作，请点下面的按钮选容器/VM 再点确认，或直接发命令（/docker、/esxi），"
+                         "我直接在 NAS 上执行，不用去 2 号。只看状态的话直接说“系统状态”就行。")
+                markup = main_keyboard()
+        elif any(k in text for k in ("容器更新", "镜像更新", "更新容器", "有更新", "检查更新")):
             if start_image_check(manual=True, chat_id=chat_id):
                 reply = "🔍 正在检查全部容器的镜像更新（约 1-2 分钟），查完会发消息。"
             else:
                 reply = "正在检查镜像更新，稍等。"
             markup = back_keyboard()
-        elif any(k in text for k in ("系统状态", "状态", "负载", "内存", "cpu")):
+        elif any(k in text for k in ("系统状态", "状态", "负载", "内存", "cpu",
+                                     "磁盘", "空间", "硬盘", "温度", "流量", "网络")):
+            # 磁盘、温度、网络流量都已并入系统状态，直接回系统状态。
             reply, markup = fmt_status(), refresh_back_keyboard("menu:status")
         elif "公网" in text or "出口" in text or text.strip() == "ip":
             reply, markup = public_ip_text(), refresh_back_keyboard("menu:ip")
-        elif "容器" in text and any(k in text for k in ("资源", "占用", "cpu")):
-            reply, markup = stats_text(), refresh_back_keyboard("menu:stats")
         elif "容器" in text:
-            reply, markup = "🐳 容器列表\n" + fmt_containers(), refresh_back_keyboard("menu:containers")
-        elif any(k in text for k in ("磁盘", "空间", "硬盘")):
-            reply, markup = disk_text(), refresh_back_keyboard("menu:disk")
-        elif "温度" in text:
-            reply, markup = temp_text(), refresh_back_keyboard("menu:temp")
+            keyboard, page, total_pages, total = manage_keyboard(0)
+            reply = (f"🛠️ 容器管理（共 {total} 个，第 {page + 1}/{total_pages} 页）\n"
+                     "点容器查看详情、启停、看日志。")
+            markup = keyboard
         elif "进程" in text or "top" in text:
             reply, markup = top_text(), refresh_back_keyboard("menu:top")
-        elif "流量" in text or "网络" in text:
-            reply, markup = net_text(), refresh_back_keyboard("menu:net")
+            parse_mode = "HTML"
         elif "esxi" in text or "虚拟机" in text or " vm" in text or text.strip() == "vm":
             if not esxi_configured():
                 reply, markup = "ESXi 未配置：在 .env 里填 ESXI_HOST/ESXI_USER/ESXI_PASSWORD 后重启容器。", back_keyboard()
@@ -1971,7 +2086,7 @@ def handle_plain_text(raw, chat_id, message_id):
     except Exception as e:
         reply, markup = f"出错了：{e}", back_keyboard()
         log("plain-text handler error:", traceback.format_exc(limit=3))
-    send_reply(chat_id, reply, reply_to=message_id, reply_markup=markup)
+    send_reply(chat_id, reply, reply_to=message_id, reply_markup=markup, parse_mode=parse_mode)
 
 
 def handle(text, chat_id, message_id):
@@ -1994,15 +2109,21 @@ def handle(text, chat_id, message_id):
             send_reply(chat_id, reply, reply_to=message_id, reply_markup=main_keyboard())
             return
         if cmd == "status":
-            reply = fmt_status() + "\n\n【容器】\n" + fmt_containers()
-            if esxi_configured():
-                vms = esxi_vms()
-                reply += "\n\n【ESXi VM】\n" + "\n".join(
-                    f"{v['vmid']} {v['name']} {v['state']}" for v in vms)
-            else:
-                reply += "\n\n【ESXi】未配置"
+            reply = fmt_status()
+        elif cmd == "topmem":
+            reply = top_mem_text()
+            send_reply(chat_id, reply, reply_to=message_id, parse_mode="HTML")
+            return
+        elif cmd == "services":
+            reply = truenas_services_text()
+            send_reply(chat_id, reply, reply_to=message_id)
+            return
         elif cmd == "docker" and not args:
-            reply = fmt_containers()
+            keyboard, page, total_pages, total = manage_keyboard(0)
+            send_reply(chat_id,
+                       f"🛠️ 容器管理（共 {total} 个，第 {page + 1}/{total_pages} 页）\n点容器查看详情、启停、看日志。",
+                       reply_to=message_id, reply_markup=keyboard)
+            return
         elif cmd == "docker" and args and args[0] == "logs" and len(args) >= 2:
             tail, keyword = 50, None
             if len(args) >= 3 and args[2].isdigit():
@@ -2028,7 +2149,7 @@ def handle(text, chat_id, message_id):
                        reply_to=message_id, reply_markup=confirm_keyboard(f"c:do:update:{c['Id'][:12]}", f"c:detail:{c['Id'][:12]}"))
             return
         elif cmd == "docker":
-            reply = "用法：/docker [logs <容器> [行数] [关键词] | start|stop|restart <容器> | prune | update <容器>]"
+            reply = "用法：/docker [logs <容器> [行数] [关键词] | start|stop|restart <容器> | prune | update <容器>]（不带参数打开容器管理）"
         elif cmd == "esxi" and not args:
             if not esxi_configured():
                 reply = "ESXi 未配置：在 .env 里填 ESXI_HOST/ESXI_USER/ESXI_PASSWORD 后重启容器。"
@@ -2043,11 +2164,7 @@ def handle(text, chat_id, message_id):
                 reply = f"{v['name']}（{v['vmid']}）{args[0]}：{out or '命令已发送'}"
         elif cmd == "esxi":
             reply = "用法：/esxi [on|off|kill <VM 名或 ID>]"
-        elif cmd == "update":
-            text, markup = check_github_update()
-            send_reply(chat_id, text, reply_to=message_id, reply_markup=markup)
-            return
-        elif cmd == "check_updates":
+        elif cmd == "container_updates":
             if start_image_check(manual=True, chat_id=chat_id):
                 send_reply(chat_id, "🔍 正在检查全部容器的镜像更新（约 1-2 分钟），查完会发消息。",
                            reply_to=message_id, reply_markup=back_keyboard())
@@ -2062,8 +2179,6 @@ def handle(text, chat_id, message_id):
                 set_alerts_enabled(False)
             send_reply(chat_id, alerts_status_text(), reply_to=message_id, reply_markup=alerts_keyboard())
             return
-        elif cmd == "disk":
-            reply = disk_text()
         else:
             send_reply(chat_id, "不认识的命令，发 /help 看看能做什么，或直接点下面的按钮。",
                        reply_to=message_id, reply_markup=main_keyboard())
@@ -2080,12 +2195,12 @@ ACTION_LABEL = {"start": "启动", "stop": "停止", "restart": "重启",
                 "on": "开机", "off": "优雅关机", "kill": "强制断电"}
 
 
-def _edit_or_send(chat_id, message_id, text, reply_markup=None):
+def _edit_or_send(chat_id, message_id, text, reply_markup=None, parse_mode=None):
     try:
-        edit_message(chat_id, message_id, text, reply_markup=reply_markup)
+        edit_message(chat_id, message_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
     except Exception as e:
         log("edit 失败，改发新消息：", e)
-        send_reply(chat_id, text, reply_markup=reply_markup)
+        send_reply(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
 
 
 def handle_callback(query):
@@ -2106,23 +2221,24 @@ def handle_callback(query):
         _clear_pending_search(chat_id)
         if data == "menu:main":
             _edit_or_send(chat_id, message_id, WELCOME, main_keyboard())
+        elif data.startswith("op:do:"):
+            token = data[len("op:do:"):]
+            try:
+                result = execute_pending_op(token)
+                _edit_or_send(chat_id, message_id, result, back_keyboard())
+            except Exception as e:
+                _edit_or_send(chat_id, message_id, f"执行失败：{e}", back_keyboard())
+        elif data.startswith("op:cancel:"):
+            token = data[len("op:cancel:"):]
+            _PENDING_OPS.pop(token, None)
+            _edit_or_send(chat_id, message_id, "已取消，没有执行任何操作。", back_keyboard())
         elif data == "menu:status":
             _edit_or_send(chat_id, message_id, fmt_status(), refresh_back_keyboard("menu:status"))
         elif data == "menu:ip":
             _edit_or_send(chat_id, message_id, public_ip_text(), refresh_back_keyboard("menu:ip"))
-        elif data == "menu:containers":
-            _edit_or_send(chat_id, message_id, "🐳 容器列表\n" + fmt_containers(),
-                          refresh_back_keyboard("menu:containers"))
-        elif data == "menu:stats":
-            _edit_or_send(chat_id, message_id, stats_text(), refresh_back_keyboard("menu:stats"))
-        elif data == "menu:disk":
-            _edit_or_send(chat_id, message_id, disk_text(), refresh_back_keyboard("menu:disk"))
-        elif data == "menu:temp":
-            _edit_or_send(chat_id, message_id, temp_text(), refresh_back_keyboard("menu:temp"))
         elif data == "menu:top":
-            _edit_or_send(chat_id, message_id, top_text(), refresh_back_keyboard("menu:top"))
-        elif data == "menu:net":
-            _edit_or_send(chat_id, message_id, net_text(), refresh_back_keyboard("menu:net"))
+            _edit_or_send(chat_id, message_id, top_text(), refresh_back_keyboard("menu:top"),
+                          parse_mode="HTML")
         elif data.startswith("menu:manage:"):
             try:
                 page = int(data.rsplit(":", 1)[1])
@@ -2162,26 +2278,74 @@ def handle_callback(query):
                 _edit_or_send(chat_id, message_id,
                               f"🔄 重启命令已发送：{v['name']}（{v['vmid']}）\n{out or '（ESXi 无回显）'}\nNAS 重启中，机器人稍后自动恢复。",
                               back_keyboard())
-        elif data == "menu:update":
-            text, markup = check_github_update()
-            _edit_or_send(chat_id, message_id, text, markup)
         elif data == "menu:update_do":
             ok, result = install_staged_update()
             if not ok:
                 _edit_or_send(chat_id, message_id, f"更新失败：{result}", back_keyboard())
             else:
                 _edit_or_send(chat_id, message_id,
-                              f"✅ v{result} 已安装，正在重启…重启成功后会发消息确认。",
+                              f"✅ v{result} 已安装，正在重启…",
                               back_keyboard())
                 restart_self_delayed()
         elif data == "menu:update_cancel":
             _clear_staging()
             _edit_or_send(chat_id, message_id, "已取消更新。", back_keyboard())
-        elif data == "menu:check_updates":
+        elif data == "menu:container_updates":
             if start_image_check(manual=True, chat_id=chat_id):
                 _edit_or_send(chat_id, message_id, "🔍 正在检查全部容器的镜像更新（约 1-2 分钟），查完会发消息。", back_keyboard())
             else:
                 _edit_or_send(chat_id, message_id, "正在检查镜像更新，稍等。", back_keyboard())
+        elif data.startswith("img:ignore:"):
+            shortid = data.rsplit(":", 1)[1]
+            state = _load_image_check_state()
+            notified = state.get("notified", {})
+            ignored = state.get("ignored", {})
+            full_cid, entry = None, None
+            for r in _LAST_IMAGE_CHECK_RESULTS:
+                if r.get("cid", "").startswith(shortid) and r.get("status") == "update":
+                    entry, full_cid = r, r["cid"]
+                    break
+            if entry is not None:
+                ignored[full_cid] = {"name": entry["name"], "image": entry["image"],
+                                     "new_id": entry.get("new_id", "")}
+            elif any(c.startswith(shortid) for c in notified):
+                full_cid = next(c for c in notified if c.startswith(shortid))
+                try:
+                    c = resolve_container(full_cid)
+                    ignored[full_cid] = {"name": container_display_name(c),
+                                         "image": (c.get("Image") or "").strip(),
+                                         "new_id": notified[full_cid]}
+                except Exception:
+                    ignored[full_cid] = {"name": shortid, "image": "",
+                                         "new_id": notified[full_cid]}
+            if full_cid is None:
+                _edit_or_send(chat_id, message_id, "找不到这条更新记录，请重新点“容器更新”检查。", back_keyboard())
+            else:
+                state["ignored"] = ignored
+                _save_image_check_state(state)
+                if _LAST_IMAGE_CHECK_RESULTS:
+                    text, markup = format_image_check_report(_LAST_IMAGE_CHECK_RESULTS)
+                    _edit_or_send(chat_id, message_id, text, markup)
+                else:
+                    _edit_or_send(chat_id, message_id,
+                                  f"已忽略 {ignored[full_cid].get('name') or shortid} 的这次更新，下次有新镜像时会再提醒。",
+                                  back_keyboard())
+        elif data.startswith("img:unignore:"):
+            shortid = data.rsplit(":", 1)[1]
+            state = _load_image_check_state()
+            ignored = state.get("ignored", {})
+            full_cid = next((c for c in ignored if c.startswith(shortid)), None)
+            if full_cid is None:
+                _edit_or_send(chat_id, message_id, "这条忽略记录已经不在了。", back_keyboard())
+            else:
+                name = (ignored[full_cid] or {}).get("name") or shortid
+                del ignored[full_cid]
+                state["ignored"] = ignored
+                _save_image_check_state(state)
+                _edit_or_send(chat_id, message_id,
+                              f"✅ 已恢复 {name}：下次检查到新镜像时会再提醒。",
+                              kb([[btn("🔍 容器更新", "menu:container_updates"),
+                                   btn("⬅️ 主菜单", "menu:main")]]))
         elif data == "menu:alerts":
             _edit_or_send(chat_id, message_id, alerts_status_text(), alerts_keyboard())
         elif data in ("alerts:on", "alerts:off"):
@@ -2307,7 +2471,6 @@ def main():
         "磁盘路径：", ",".join(HOST_DATA_PATHS),
         "镜像检查：", ("开/" + str(IMAGE_CHECK_INTERVAL_SEC) + "s") if IMAGE_CHECK_ENABLED else "关",
         "版本：", BOT_VERSION)
-    announce_pending_update()
     _alert_init_baseline()
     last_health = time.monotonic()
     next_image_check = time.monotonic() + 60  # 启动 60 秒后先查一次，之后按间隔自动查
