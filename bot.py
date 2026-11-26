@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""3 号机器人：NAS + Docker + ESXi 管理（v2.5.0：内存 TOP5 + 操作授权确认 + TrueNAS 系统服务）。
+"""3 号机器人：NAS + Docker + ESXi 管理（v2.5.1：容器更新检查修复镜像名解析）。
 
 部署在 NAS（ESXi 上的 VM）里的 Docker 容器中，通过 OpenBox SOCKS5 代理
 访问 Telegram Bot API（长轮询，不需要 webhook、不需要开 inbound 端口）。
@@ -11,6 +11,9 @@
 - ESXi：SSH（paramiko）执行 vim-cmd / esxcli。
 - 只认 OWNER_CHAT_ID 一个人；没有任意命令执行功能。
 - 危险操作（停容器、重启容器、关 VM、重启 NAS）要点两次确认。
+- v2.5.1：容器更新检查改用 inspect 的 Config.Image 解析镜像名（列表接口在标签被顶掉后
+  只给短 ID，拿去拉取会 404）；本地构建镜像跳过检查；私有仓库拉取自动带 NAS 上
+  docker login 存的凭据。
 - v2.5.0：打字说“内存 TOP5”直接查（只读）；说“重启 X”先报计划，点 ✅ 才执行，5 分钟过期；
   TrueNAS 系统服务（ssh/cifs/nfs 等）走 NAS 主机 SSH 的 midclt，名字先对实时服务列表校验，
   不在列表里的不执行；middlewared、docker 等关键服务永不重启。
@@ -80,7 +83,7 @@ _HOST_DATA_PATHS_RAW = os.environ.get("HOST_DATA_PATHS", "").strip()
 HOST_DATA_PATHS = [p.strip() for p in _HOST_DATA_PATHS_RAW.split(",") if p.strip()] or ["/mnt/PT", "/mnt/Strongge"]
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
-BOT_VERSION = "2.5.0"
+BOT_VERSION = "2.5.1"
 SELF_CONTAINER_NAME = os.environ.get("SELF_CONTAINER_NAME", "tg-bot3").strip() or "tg-bot3"
 ALERT_ENABLED_DEFAULT = os.environ.get("ALERT_ENABLED", "1").strip() not in ("0", "false", "no")
 ALERT_INTERVAL_SEC = _env_int("ALERT_INTERVAL_SEC", 300)
@@ -349,13 +352,111 @@ def _split_image(image):
     return image, "latest"
 
 
+_IMAGE_ID_RE = re.compile(r"^(sha256:)?[0-9a-f]{12,64}$")
+
+
+def _is_image_id_ref(ref):
+    """列表接口在镜像标签被新镜像顶掉后会把 Image 字段显示成短 ID，
+    这种值不是仓库名，拿去拉取只会得到 404 pull access denied。"""
+    return bool(_IMAGE_ID_RE.match((ref or "").strip().lower()))
+
+
+def _container_image_ref(c, inspect_data=None):
+    """容器真正用的镜像名：优先 inspect 的 Config.Image（创建时写死的引用），
+    列表接口的 Image 在标签被顶掉后会退化成短 ID，不能拿来拉取。"""
+    cfg_image = (((inspect_data or {}).get("Config") or {}).get("Image") or "").strip()
+    if cfg_image:
+        return cfg_image
+    return (c.get("Image") or "").strip()
+
+
+def _registry_of(name):
+    first = name.split("/", 1)[0]
+    if "/" in name and ("." in first or ":" in first or first == "localhost"):
+        return first
+    return "docker.io"
+
+
+def _docker_config_paths():
+    paths = []
+    cfg_file = os.environ.get("DOCKER_CONFIG_FILE", "").strip()
+    if cfg_file:
+        paths.append(cfg_file)
+    cfg_dir = os.environ.get("DOCKER_CONFIG", "").strip()
+    if cfg_dir:
+        paths.append(os.path.join(cfg_dir, "config.json"))
+    # bot 容器把 NAS 根目录只读挂在 /host，NAS 上 docker login 存的凭据在那里。
+    paths.append("/host/root/.docker/config.json")
+    paths.append(os.path.expanduser("~/.docker/config.json"))
+    paths.append("/root/.docker/config.json")
+    return paths
+
+
+def _registry_auth_header(name):
+    """为私有仓库拉取拼 X-Registry-Auth；没有可用凭据返回 None。
+    Engine API 拉取不会自动用 docker login 存的凭据，必须显式带上。
+    凭据只在内存里拼请求头，绝不写日志。"""
+    try:
+        registry = _registry_of(name)
+        wanted = {registry}
+        if registry == "docker.io":
+            wanted |= {"index.docker.io", "registry-1.docker.io", "docker.io"}
+        auths = {}
+        for path in _docker_config_paths():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    auths = (json.load(f) or {}).get("auths") or {}
+                if auths:
+                    break
+            except Exception:
+                continue
+        for key, entry in auths.items():
+            host = re.sub(r"^https?://", "", str(key)).split("/")[0]
+            if host not in wanted or not isinstance(entry, dict):
+                continue
+            if entry.get("identitytoken"):
+                payload = {"identitytoken": entry["identitytoken"]}
+            else:
+                user = entry.get("username", "")
+                password = entry.get("password", "")
+                if not user and entry.get("auth"):
+                    import base64 as _b64
+                    decoded = _b64.b64decode(entry["auth"]).decode("utf-8", "replace")
+                    user, _, password = decoded.partition(":")
+                if not user:
+                    continue
+                payload = {"username": user, "password": password,
+                           "serveraddress": registry}
+            import base64 as _b64
+            return _b64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    except Exception:
+        return None
+    return None
+
+
+def _image_has_repo_digest(image_id):
+    """镜像是否来自仓库（有 RepoDigests）。本地构建的没有。
+    查不到时返回 None（未知），调用方按可检查处理。"""
+    if not image_id:
+        return None
+    try:
+        img = docker_json("GET", "/images/" + quote(image_id, safe="") + "/json")
+        return bool((img or {}).get("RepoDigests"))
+    except Exception:
+        return None
+
+
 def docker_pull(image, timeout=600):
     """拉取镜像。返回 (ok, message)。流式读进度，遇到 error 即失败。"""
     name, tag = _split_image(image)
     path = f"/images/create?fromImage={quote(name, safe='')}&tag={quote(tag, safe='')}"
+    headers = {}
+    auth = _registry_auth_header(name)
+    if auth:
+        headers["X-Registry-Auth"] = auth
     conn = UnixHTTPConnection(DOCKER_SOCK, timeout=timeout)
     try:
-        conn.request("POST", path)
+        conn.request("POST", path, headers=headers)
         resp = conn.getresponse()
         if resp.status >= 400:
             return False, f"拉取失败 {resp.status}：{resp.read()[:200]!r}"
@@ -506,13 +607,15 @@ def _update_container_inner(query):
     cid = c["Id"]
     if name == SELF_CONTAINER_NAME:
         return False, "3 号自己不能用这种方式更新：把新版 bot.py 文件发给我，我验证后问你装不装。"
-    image_ref = (c.get("Image") or "").strip()
-    if not image_ref:
-        return False, "读不到该容器的镜像名，无法更新。"
     try:
         inspect_data = inspect_container(cid)
     except Exception as e:
         return False, f"读容器详情失败：{e}"
+    image_ref = _container_image_ref(c, inspect_data)
+    if not image_ref:
+        return False, "读不到该容器的镜像名，无法更新。"
+    if _is_image_id_ref(image_ref):
+        return False, "该容器的镜像只剩 ID（标签已丢失），无法按名字拉取更新；请用 compose 更新。"
     old_image_id = inspect_data.get("Image", "")
     try:
         ok, pull_msg = docker_pull(image_ref)
@@ -1651,17 +1754,27 @@ def check_container_image_updates():
         cid = c["Id"]
         if name == SELF_CONTAINER_NAME:
             continue
-        image_ref = (c.get("Image") or "").strip()
+        try:
+            inspect_data = inspect_container(cid)
+        except Exception as e:
+            results.append({"cid": cid, "name": name,
+                            "image": (c.get("Image") or "").strip(),
+                            "status": "error", "error": f"读详情失败：{e}"})
+            continue
+        image_ref = _container_image_ref(c, inspect_data)
         base = {"cid": cid, "name": name, "image": image_ref}
         if not image_ref:
             results.append({**base, "status": "error", "error": "读不到镜像名"})
             continue
-        try:
-            inspect_data = inspect_container(cid)
-        except Exception as e:
-            results.append({**base, "status": "error", "error": f"读详情失败：{e}"})
+        if _is_image_id_ref(image_ref):
+            results.append({**base, "status": "skipped",
+                            "error": "镜像只剩 ID（标签已丢失），无法检查更新"})
             continue
         old_id = inspect_data.get("Image", "")
+        if _image_has_repo_digest(old_id) is False:
+            results.append({**base, "status": "skipped",
+                            "error": "本地构建镜像，没有仓库可检查"})
+            continue
         try:
             ok, pull_msg = docker_pull(image_ref, timeout=300)
         except ValueError as e:
@@ -1722,6 +1835,8 @@ def format_image_check_report(results):
             lines.append(f"   旧：{_short_id(r.get('old_id', ''))} → 新：{_short_id(r.get('new_id', ''))}")
     elif ignored_rows:
         lines.append("\n没有新的更新（有更新的都已忽略）。")
+    elif problems:
+        lines.append("\n没有检测到新镜像（有容器没检查成，见下）。")
     else:
         lines.append("\n全部容器都已是最新。")
     lines.append(f"\n共 {len(results)} 个容器：{len(updates)} 个有更新，{current} 个已是最新，"
@@ -1941,7 +2056,7 @@ def container_detail_text(c, inspect=None):
     ports = c.get("Ports") or []
     port_s = ", ".join(f"{p.get('PublicPort', '')}->{p.get('PrivatePort', '')}" for p in ports if p.get("PrivatePort")) or "无"
     text = (f"🐳 {name}\n"
-            f"镜像：{c.get('Image', '?')}\n"
+            f"镜像：{_container_image_ref(c, inspect) or '?'}\n"
             f"状态：{c.get('State', '?')} {c.get('Status', '')}\n"
             f"ID：{c.get('Id', '')[:12]}\n"
             f"端口：{port_s}")
@@ -2312,8 +2427,12 @@ def handle_callback(query):
                 full_cid = next(c for c in notified if c.startswith(shortid))
                 try:
                     c = resolve_container(full_cid)
+                    try:
+                        _ign_image = _container_image_ref(c, inspect_container(c["Id"]))
+                    except Exception:
+                        _ign_image = (c.get("Image") or "").strip()
                     ignored[full_cid] = {"name": container_display_name(c),
-                                         "image": (c.get("Image") or "").strip(),
+                                         "image": _ign_image,
                                          "new_id": notified[full_cid]}
                 except Exception:
                     ignored[full_cid] = {"name": shortid, "image": "",
@@ -2374,8 +2493,12 @@ def handle_callback(query):
         elif data.startswith("c:ask:update:"):
             shortid = data.rsplit(":", 1)[1]
             c = resolve_container(shortid)
+            try:
+                _upd_image = _container_image_ref(c, inspect_container(c["Id"]))
+            except Exception:
+                _upd_image = (c.get("Image") or "").strip()
             _edit_or_send(chat_id, message_id,
-                          f"确定要更新容器“{container_display_name(c)}”吗？\n会拉取新镜像（{c.get('Image', '?')}）并重建容器，旧容器保留到新容器跑起来后才删，失败会自动回滚。\n只适合常驻服务容器；compose 管理的栈建议用 compose 更新。",
+                          f"确定要更新容器“{container_display_name(c)}”吗？\n会拉取新镜像（{_upd_image or '?'}）并重建容器，旧容器保留到新容器跑起来后才删，失败会自动回滚。\n只适合常驻服务容器；compose 管理的栈建议用 compose 更新。",
                           confirm_keyboard(f"c:do:update:{c['Id'][:12]}", f"c:detail:{c['Id'][:12]}"))
         elif data.startswith("c:do:update:"):
             shortid = data.rsplit(":", 1)[1]
