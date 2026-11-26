@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""3 号机器人：NAS + Docker + ESXi 管理（v2.5.2：容器更新列表升级后可直接返回剩余列表）。
+"""3 号机器人：NAS + Docker + ESXi 管理（v2.5.3：容器更新支持批量勾选升级）。
 
 部署在 NAS（ESXi 上的 VM）里的 Docker 容器中，通过 OpenBox SOCKS5 代理
 访问 Telegram Bot API（长轮询，不需要 webhook、不需要开 inbound 端口）。
@@ -11,6 +11,8 @@
 - ESXi：SSH（paramiko）执行 vim-cmd / esxcli。
 - 只认 OWNER_CHAT_ID 一个人；没有任意命令执行功能。
 - 危险操作（停容器、重启容器、关 VM、重启 NAS）要点两次确认。
+- v2.5.3：容器更新报告去重（正文只留汇总，容器列表只在按钮里）+ 批量勾选：
+  点容器名勾选/取消，可全选，选好后一次确认批量升级或批量忽略。
 - v2.5.2：容器更新报告缓存可返回：升级完自动回到剩余更新列表，不用重新全量检测；
   主菜单“容器更新”先显示上次检查结果，报告里有“重新检查”按钮强制重查。
 - v2.5.1：容器更新检查改用 inspect 的 Config.Image 解析镜像名（列表接口在标签被顶掉后
@@ -85,7 +87,7 @@ _HOST_DATA_PATHS_RAW = os.environ.get("HOST_DATA_PATHS", "").strip()
 HOST_DATA_PATHS = [p.strip() for p in _HOST_DATA_PATHS_RAW.split(",") if p.strip()] or ["/mnt/PT", "/mnt/Strongge"]
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
-BOT_VERSION = "2.5.2"
+BOT_VERSION = "2.5.3"
 SELF_CONTAINER_NAME = os.environ.get("SELF_CONTAINER_NAME", "tg-bot3").strip() or "tg-bot3"
 ALERT_ENABLED_DEFAULT = os.environ.get("ALERT_ENABLED", "1").strip() not in ("0", "false", "no")
 ALERT_INTERVAL_SEC = _env_int("ALERT_INTERVAL_SEC", 300)
@@ -752,6 +754,57 @@ def update_container_async(query, chat_id, message_id=None):
                     _send_via_new_session(chat_id, text, markup)
                 except Exception as e2:
                     log("update report send failed:", e2)
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def update_containers_batch_async(cids, chat_id, message_id=None):
+    """批量升级：逐个走单容器更新流程，进度写回那条消息，
+    全部完成后发汇总并把消息改回剩余更新列表。"""
+    def _run():
+        entries = {r.get("cid"): r for r in _LAST_IMAGE_CHECK_RESULTS}
+        done = []
+        for idx, cid in enumerate(cids, 1):
+            name = (entries.get(cid) or {}).get("name") or cid[:12]
+            if message_id:
+                try:
+                    _edit_via_new_session(
+                        chat_id, message_id,
+                        f"⬆️ 批量升级中（{idx}/{len(cids)}）：正在更新“{name}”…")
+                except Exception as e:
+                    log("batch progress edit failed:", e)
+            try:
+                ok, msg = update_container_flow(cid[:12])
+            except Exception:
+                log("batch update thread error:", traceback.format_exc(limit=3))
+                ok, msg = False, "更新过程出错了，请看容器日志。"
+            if ok:
+                _mark_image_check_updated(cid)
+            done.append((name, ok, msg))
+        ok_names = [n for n, ok, _ in done if ok]
+        fail_lines = [f"⚠️ {n}：{m[:60]}" for n, ok, m in done if not ok]
+        summary = f"批量升级完成：成功 {len(ok_names)} 个，失败 {len(fail_lines)} 个。"
+        if ok_names:
+            summary += "\n✅ " + "、".join(ok_names)
+        if fail_lines:
+            summary += "\n" + "\n".join(fail_lines)
+        try:
+            _send_via_new_session(chat_id, summary)
+        except Exception as e:
+            log("batch summary send failed:", e)
+        cached = _cached_image_report()
+        if cached:
+            text, markup = cached
+            try:
+                if message_id:
+                    _edit_via_new_session(chat_id, message_id, text, markup)
+                else:
+                    _send_via_new_session(chat_id, text, markup)
+            except Exception as e:
+                log("batch report restore failed:", e)
+                try:
+                    _send_via_new_session(chat_id, text, markup)
+                except Exception as e2:
+                    log("batch report send failed:", e2)
     threading.Thread(target=_run, daemon=True).start()
 
 
@@ -1768,6 +1821,8 @@ def _load_image_check_state():
 # 也供升级完直接返回剩余列表、主菜单“容器更新”秒回上次结果，不用重新全量检测）。
 _LAST_IMAGE_CHECK_RESULTS = []
 _LAST_IMAGE_CHECK_TIME = ""
+# 批量勾选状态：存容器完整 Id；新一轮检查后按最新结果修剪。
+_IMAGE_CHECK_SELECTED = set()
 
 
 def _save_image_check_state(state):
@@ -1861,12 +1916,22 @@ def _cached_image_report():
     return format_image_check_report(_LAST_IMAGE_CHECK_RESULTS)
 
 
+def _selected_updates():
+    """当前勾选且仍有更新的缓存条目（按列表顺序）。"""
+    state = _load_image_check_state()
+    ignored = state.get("ignored", {})
+    return [r for r in _LAST_IMAGE_CHECK_RESULTS
+            if r.get("status") == "update" and not _is_ignored(ignored, r)
+            and r.get("cid") in _IMAGE_CHECK_SELECTED]
+
+
 def _mark_image_check_updated(query):
     """某个容器升级成功后，把缓存结果里那条标成已最新，
     这样返回列表时不用重新检测、也不会再催升同一个。"""
     for r in _LAST_IMAGE_CHECK_RESULTS:
         if r.get("cid", "").startswith(query) or r.get("name") == query:
             old_cid = r.get("cid", "")
+            _IMAGE_CHECK_SELECTED.discard(old_cid)
             r["status"] = "current"
             if r.get("new_id"):
                 r["old_id"] = r["new_id"]
@@ -1898,16 +1963,11 @@ def format_image_check_report(results, checked_at=None):
     current = sum(1 for r in results if r["status"] == "current")
     problems = [r for r in results if r["status"] in ("error", "skipped")]
     lines = [f"🔍 容器更新（{checked_at or _LAST_IMAGE_CHECK_TIME or cst_now()}）"]
-    if updates:
-        lines.append("")
-        for r in updates:
-            lines.append(f"⬆️ {r['name']}（{r['image']}）有新镜像")
-            lines.append(f"   旧：{_short_id(r.get('old_id', ''))} → 新：{_short_id(r.get('new_id', ''))}")
-    elif ignored_rows:
+    if not updates and ignored_rows:
         lines.append("\n没有新的更新（有更新的都已忽略）。")
-    elif problems:
+    elif not updates and problems:
         lines.append("\n没有检测到新镜像（有容器没检查成，见下）。")
-    else:
+    elif not updates:
         lines.append("\n全部容器都已是最新。")
     lines.append(f"\n共 {len(results)} 个容器：{len(updates)} 个有更新，{current} 个已是最新，"
                  f"{len(problems)} 个检查失败/跳过{'' if not ignored_rows else f'，{len(ignored_rows)} 个已忽略'}。")
@@ -1915,18 +1975,26 @@ def format_image_check_report(results, checked_at=None):
         lines.append(f"⚠️ {r['name']}：{r.get('error', '')[:40]}")
     if len(problems) > 5:
         lines.append(f"…还有 {len(problems) - 5} 个未列出。")
-    if ignored_rows:
-        lines.append("\n🙈 已忽略（出了更新的版本会再提醒）：")
-        for r in ignored_rows:
-            lines.append(f"· {r['name']}（{r['image']}）")
+    selected = [r for r in updates if r.get("cid") in _IMAGE_CHECK_SELECTED]
     if updates:
-        lines.append("\n点 [⬆️ 升级] 确认更新某个容器，不点就不动；点 [🚫 忽略] 这次就不再提醒。")
+        lines.append(f"\n点容器名勾选（可多选），已选 {len(selected)} 个；选好点 [⬆️ 升级所选]。")
     rows = []
-    for r in updates:
-        rows.append([btn(f"⬆️ 升级 {r['name']}", f"c:ask:update:{r['cid'][:12]}"),
-                     btn("🚫 忽略", f"img:ignore:{r['cid'][:12]}")])
-    for r in ignored_rows:
-        rows.append([btn(f"↩️ 恢复 {r['name']}", f"img:unignore:{r['cid'][:12]}")])
+    # 容器列表只放在按钮里（每行两个勾选按钮），正文不再重复列一遍。
+    for i in range(0, len(updates), 2):
+        row = []
+        for r in updates[i:i + 2]:
+            mark = "☑️" if r.get("cid") in _IMAGE_CHECK_SELECTED else "⬜"
+            row.append(btn(f"{mark} {r['name']}", f"img:sel:{r['cid'][:12]}"))
+        rows.append(row)
+    if updates:
+        rows.append([btn("☑️ 全选", "img:selall"), btn("⬜ 清空", "img:selnone")])
+        rows.append([btn(f"⬆️ 升级所选 ({len(selected)})", "img:ask:batch"),
+                     btn("🚫 忽略所选", "img:ignore:batch")])
+    for i in range(0, len(ignored_rows), 2):
+        row = []
+        for r in ignored_rows[i:i + 2]:
+            row.append(btn(f"↩️ {r['name']}", f"img:unignore:{r['cid'][:12]}"))
+        rows.append(row)
     rows.append([btn("🔄 重新检查", "menu:container_updates_recheck"),
                  btn("⬅️ 主菜单", "menu:main")])
     return truncate("\n".join(lines)), kb(rows)
@@ -1944,6 +2012,8 @@ def run_image_check(manual, chat_id):
         return
     _LAST_IMAGE_CHECK_RESULTS = results
     _LAST_IMAGE_CHECK_TIME = cst_now()
+    _IMAGE_CHECK_SELECTED.intersection_update(
+        {r["cid"] for r in results if r.get("status") == "update"})
     state = _load_image_check_state()
     notified = state.get("notified", {})
     ignored = state.get("ignored", {})
@@ -2491,6 +2561,77 @@ def handle_callback(query):
                 _edit_or_send(chat_id, message_id, "🔍 正在重新检查全部容器的镜像更新（约 1-2 分钟），查完会发消息。", back_keyboard())
             else:
                 _edit_or_send(chat_id, message_id, "正在检查镜像更新，稍等。", back_keyboard())
+        elif data.startswith("img:sel:"):
+            shortid = data.rsplit(":", 1)[1]
+            for r in _LAST_IMAGE_CHECK_RESULTS:
+                if r.get("cid", "").startswith(shortid) and r.get("status") == "update":
+                    if r["cid"] in _IMAGE_CHECK_SELECTED:
+                        _IMAGE_CHECK_SELECTED.discard(r["cid"])
+                    else:
+                        _IMAGE_CHECK_SELECTED.add(r["cid"])
+                    break
+            cached = _cached_image_report()
+            if cached:
+                text, markup = cached
+                _edit_or_send(chat_id, message_id, text, markup)
+        elif data == "img:selall":
+            state = _load_image_check_state()
+            ignored = state.get("ignored", {})
+            for r in _LAST_IMAGE_CHECK_RESULTS:
+                if r.get("status") == "update" and not _is_ignored(ignored, r):
+                    _IMAGE_CHECK_SELECTED.add(r["cid"])
+            cached = _cached_image_report()
+            if cached:
+                text, markup = cached
+                _edit_or_send(chat_id, message_id, text, markup)
+        elif data == "img:selnone":
+            _IMAGE_CHECK_SELECTED.clear()
+            cached = _cached_image_report()
+            if cached:
+                text, markup = cached
+                _edit_or_send(chat_id, message_id, text, markup)
+        elif data == "img:ask:batch":
+            selected = _selected_updates()
+            if not selected:
+                cached = _cached_image_report()
+                if cached:
+                    text, markup = cached
+                    _edit_or_send(chat_id, message_id,
+                                  text + "\n\n⚠️ 还没勾选，先点容器名勾选再升级。", markup)
+            else:
+                names = "、".join(r["name"] for r in selected)
+                _edit_or_send(chat_id, message_id,
+                              f"确定要批量升级这 {len(selected)} 个容器吗？\n{names}\n会逐个拉取新镜像并重建，失败的会自动回滚并在汇总里说明。",
+                              confirm_keyboard("img:do:batch", "img:list"))
+        elif data == "img:do:batch":
+            selected = _selected_updates()
+            if not selected:
+                cached = _cached_image_report()
+                if cached:
+                    text, markup = cached
+                    _edit_or_send(chat_id, message_id,
+                                  text + "\n\n⚠️ 还没勾选，先点容器名勾选再升级。", markup)
+            else:
+                _edit_or_send(chat_id, message_id,
+                              f"⬆️ 开始批量升级 {len(selected)} 个容器…逐个更新，完成后会发汇总并回到剩余列表。",
+                              kb([[btn("⬅️ 返回更新列表", "img:list"),
+                                   btn("⬅️ 主菜单", "menu:main")]]))
+                update_containers_batch_async([r["cid"] for r in selected], chat_id, message_id)
+        elif data == "img:ignore:batch":
+            selected = _selected_updates()
+            if selected:
+                state = _load_image_check_state()
+                ignored = state.get("ignored", {})
+                for r in selected:
+                    ignored[r["cid"]] = {"name": r["name"], "image": r["image"],
+                                         "new_id": r.get("new_id", "")}
+                    _IMAGE_CHECK_SELECTED.discard(r["cid"])
+                state["ignored"] = ignored
+                _save_image_check_state(state)
+            cached = _cached_image_report()
+            if cached:
+                text, markup = cached
+                _edit_or_send(chat_id, message_id, text, markup)
         elif data.startswith("img:ignore:"):
             shortid = data.rsplit(":", 1)[1]
             state = _load_image_check_state()
