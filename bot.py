@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""3 号机器人：NAS + Docker + ESXi 管理（v2.5.1：容器更新检查修复镜像名解析）。
+"""3 号机器人：NAS + Docker + ESXi 管理（v2.5.2：容器更新列表升级后可直接返回剩余列表）。
 
 部署在 NAS（ESXi 上的 VM）里的 Docker 容器中，通过 OpenBox SOCKS5 代理
 访问 Telegram Bot API（长轮询，不需要 webhook、不需要开 inbound 端口）。
@@ -11,6 +11,8 @@
 - ESXi：SSH（paramiko）执行 vim-cmd / esxcli。
 - 只认 OWNER_CHAT_ID 一个人；没有任意命令执行功能。
 - 危险操作（停容器、重启容器、关 VM、重启 NAS）要点两次确认。
+- v2.5.2：容器更新报告缓存可返回：升级完自动回到剩余更新列表，不用重新全量检测；
+  主菜单“容器更新”先显示上次检查结果，报告里有“重新检查”按钮强制重查。
 - v2.5.1：容器更新检查改用 inspect 的 Config.Image 解析镜像名（列表接口在标签被顶掉后
   只给短 ID，拿去拉取会 404）；本地构建镜像跳过检查；私有仓库拉取自动带 NAS 上
   docker login 存的凭据。
@@ -83,7 +85,7 @@ _HOST_DATA_PATHS_RAW = os.environ.get("HOST_DATA_PATHS", "").strip()
 HOST_DATA_PATHS = [p.strip() for p in _HOST_DATA_PATHS_RAW.split(",") if p.strip()] or ["/mnt/PT", "/mnt/Strongge"]
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
-BOT_VERSION = "2.5.1"
+BOT_VERSION = "2.5.2"
 SELF_CONTAINER_NAME = os.environ.get("SELF_CONTAINER_NAME", "tg-bot3").strip() or "tg-bot3"
 ALERT_ENABLED_DEFAULT = os.environ.get("ALERT_ENABLED", "1").strip() not in ("0", "false", "no")
 ALERT_INTERVAL_SEC = _env_int("ALERT_INTERVAL_SEC", 300)
@@ -692,29 +694,64 @@ def _rollback_update(new_id, old_id):
         log("update rollback: start old failed:", e)
 
 
-def _send_via_new_session(chat_id, text):
+def _send_via_new_session(chat_id, text, reply_markup=None):
     """后台线程发消息：不用主线程的 session，避免并发复用。"""
     sess = requests.Session()
     if SOCKS_PROXY:
         sess.proxies = {"http": SOCKS_PROXY, "https": SOCKS_PROXY}
     payload = {"chat_id": chat_id, "text": truncate(text, MAX_REPLY)}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     resp = sess.post(f"{API}/sendMessage", json=payload, timeout=60)
     data = resp.json()
     if not data.get("ok"):
         raise RuntimeError(f"Telegram sendMessage 失败：{data}")
 
 
-def update_container_async(query, chat_id):
+def _edit_via_new_session(chat_id, message_id, text, reply_markup=None):
+    """后台线程改消息（把“开始更新”那条改回剩余更新列表）。"""
+    sess = requests.Session()
+    if SOCKS_PROXY:
+        sess.proxies = {"http": SOCKS_PROXY, "https": SOCKS_PROXY}
+    payload = {"chat_id": chat_id, "message_id": message_id,
+               "text": truncate(text, MAX_REPLY)}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    resp = sess.post(f"{API}/editMessageText", json=payload, timeout=60)
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram editMessageText 失败：{data}")
+
+
+def update_container_async(query, chat_id, message_id=None):
     def _run():
+        ok = False
         try:
-            _ok, msg = update_container_flow(query)
+            ok, msg = update_container_flow(query)
         except Exception:
             log("update thread error:", traceback.format_exc(limit=3))
             msg = "更新过程出错了，请看容器日志。"
+        if ok:
+            _mark_image_check_updated(query)
         try:
             _send_via_new_session(chat_id, msg)
         except Exception as e:
             log("update result send failed:", e)
+        # 更新完把那条消息改回剩余更新列表，不用重新全量检测就能接着升下一个。
+        cached = _cached_image_report()
+        if cached:
+            text, markup = cached
+            try:
+                if message_id:
+                    _edit_via_new_session(chat_id, message_id, text, markup)
+                else:
+                    _send_via_new_session(chat_id, text, markup)
+            except Exception as e:
+                log("update report restore failed:", e)
+                try:
+                    _send_via_new_session(chat_id, text, markup)
+                except Exception as e2:
+                    log("update report send failed:", e2)
     threading.Thread(target=_run, daemon=True).start()
 
 
@@ -1727,8 +1764,10 @@ def _load_image_check_state():
     return {"notified": {}, "ignored": {}}
 
 
-# 最近一次镜像检查的完整结果（内存里，供“忽略/恢复”按钮点完后重绘报告用）。
+# 最近一次镜像检查的完整结果（内存里，供“忽略/恢复”按钮点完后重绘报告用，
+# 也供升级完直接返回剩余列表、主菜单“容器更新”秒回上次结果，不用重新全量检测）。
 _LAST_IMAGE_CHECK_RESULTS = []
+_LAST_IMAGE_CHECK_TIME = ""
 
 
 def _save_image_check_state(state):
@@ -1815,7 +1854,38 @@ def _is_ignored(ignored, result):
     return bool(entry) and entry.get("new_id") == result.get("new_id")
 
 
-def format_image_check_report(results):
+def _cached_image_report():
+    """上次检查结果的报告（文本+键盘）；还没查过返回 None。"""
+    if not _LAST_IMAGE_CHECK_RESULTS:
+        return None
+    return format_image_check_report(_LAST_IMAGE_CHECK_RESULTS)
+
+
+def _mark_image_check_updated(query):
+    """某个容器升级成功后，把缓存结果里那条标成已最新，
+    这样返回列表时不用重新检测、也不会再催升同一个。"""
+    for r in _LAST_IMAGE_CHECK_RESULTS:
+        if r.get("cid", "").startswith(query) or r.get("name") == query:
+            old_cid = r.get("cid", "")
+            r["status"] = "current"
+            if r.get("new_id"):
+                r["old_id"] = r["new_id"]
+            try:
+                fresh = resolve_container(r["name"])
+                r["cid"] = fresh["Id"]
+            except Exception:
+                pass
+            try:
+                state = _load_image_check_state()
+                state.get("notified", {}).pop(old_cid, None)
+                state.get("ignored", {}).pop(old_cid, None)
+                _save_image_check_state(state)
+            except Exception:
+                pass
+            return
+
+
+def format_image_check_report(results, checked_at=None):
     """检查结果文本 + 键盘。
 
     每个有更新的容器一行说明 + [⬆️ 升级] [🚫 忽略] 两个按钮；
@@ -1827,7 +1897,7 @@ def format_image_check_report(results):
     ignored_rows = [r for r in results if r["status"] == "update" and _is_ignored(ignored, r)]
     current = sum(1 for r in results if r["status"] == "current")
     problems = [r for r in results if r["status"] in ("error", "skipped")]
-    lines = [f"🔍 容器更新（{cst_now()}）"]
+    lines = [f"🔍 容器更新（{checked_at or _LAST_IMAGE_CHECK_TIME or cst_now()}）"]
     if updates:
         lines.append("")
         for r in updates:
@@ -1857,13 +1927,14 @@ def format_image_check_report(results):
                      btn("🚫 忽略", f"img:ignore:{r['cid'][:12]}")])
     for r in ignored_rows:
         rows.append([btn(f"↩️ 恢复 {r['name']}", f"img:unignore:{r['cid'][:12]}")])
-    rows.append([btn("⬅️ 主菜单", "menu:main")])
+    rows.append([btn("🔄 重新检查", "menu:container_updates_recheck"),
+                 btn("⬅️ 主菜单", "menu:main")])
     return truncate("\n".join(lines)), kb(rows)
 
 
 def run_image_check(manual, chat_id):
     """跑一次全量检查。手动触发总是回报告；自动触发只在有“新”更新时通知。"""
-    global _LAST_IMAGE_CHECK_RESULTS
+    global _LAST_IMAGE_CHECK_RESULTS, _LAST_IMAGE_CHECK_TIME
     results = check_container_image_updates()
     if results and results[0].get("status") == "fatal":
         if manual:
@@ -1872,6 +1943,7 @@ def run_image_check(manual, chat_id):
             log("镜像更新自动检查失败：", results[0].get("error"))
         return
     _LAST_IMAGE_CHECK_RESULTS = results
+    _LAST_IMAGE_CHECK_TIME = cst_now()
     state = _load_image_check_state()
     notified = state.get("notified", {})
     ignored = state.get("ignored", {})
@@ -2405,9 +2477,18 @@ def handle_callback(query):
         elif data == "menu:update_cancel":
             _clear_staging()
             _edit_or_send(chat_id, message_id, "已取消更新。", back_keyboard())
-        elif data == "menu:container_updates":
-            if start_image_check(manual=True, chat_id=chat_id):
+        elif data in ("menu:container_updates", "img:list"):
+            cached = _cached_image_report()
+            if cached:
+                text, markup = cached
+                _edit_or_send(chat_id, message_id, text, markup)
+            elif start_image_check(manual=True, chat_id=chat_id):
                 _edit_or_send(chat_id, message_id, "🔍 正在检查全部容器的镜像更新（约 1-2 分钟），查完会发消息。", back_keyboard())
+            else:
+                _edit_or_send(chat_id, message_id, "正在检查镜像更新，稍等。", back_keyboard())
+        elif data == "menu:container_updates_recheck":
+            if start_image_check(manual=True, chat_id=chat_id):
+                _edit_or_send(chat_id, message_id, "🔍 正在重新检查全部容器的镜像更新（约 1-2 分钟），查完会发消息。", back_keyboard())
             else:
                 _edit_or_send(chat_id, message_id, "正在检查镜像更新，稍等。", back_keyboard())
         elif data.startswith("img:ignore:"):
@@ -2461,10 +2542,15 @@ def handle_callback(query):
                 del ignored[full_cid]
                 state["ignored"] = ignored
                 _save_image_check_state(state)
-                _edit_or_send(chat_id, message_id,
-                              f"✅ 已恢复 {name}：下次检查到新镜像时会再提醒。",
-                              kb([[btn("🔍 容器更新", "menu:container_updates"),
-                                   btn("⬅️ 主菜单", "menu:main")]]))
+                cached = _cached_image_report()
+                if cached:
+                    text, markup = cached
+                    _edit_or_send(chat_id, message_id, text, markup)
+                else:
+                    _edit_or_send(chat_id, message_id,
+                                  f"✅ 已恢复 {name}：下次检查到新镜像时会再提醒。",
+                                  kb([[btn("🔍 容器更新", "menu:container_updates"),
+                                       btn("⬅️ 主菜单", "menu:main")]]))
         elif data == "menu:alerts":
             _edit_or_send(chat_id, message_id, alerts_status_text(), alerts_keyboard())
         elif data in ("alerts:on", "alerts:off"):
@@ -2497,16 +2583,20 @@ def handle_callback(query):
                 _upd_image = _container_image_ref(c, inspect_container(c["Id"]))
             except Exception:
                 _upd_image = (c.get("Image") or "").strip()
+            _cancel = "img:list" if _LAST_IMAGE_CHECK_RESULTS else f"c:detail:{c['Id'][:12]}"
             _edit_or_send(chat_id, message_id,
                           f"确定要更新容器“{container_display_name(c)}”吗？\n会拉取新镜像（{_upd_image or '?'}）并重建容器，旧容器保留到新容器跑起来后才删，失败会自动回滚。\n只适合常驻服务容器；compose 管理的栈建议用 compose 更新。",
-                          confirm_keyboard(f"c:do:update:{c['Id'][:12]}", f"c:detail:{c['Id'][:12]}"))
+                          confirm_keyboard(f"c:do:update:{c['Id'][:12]}", _cancel))
         elif data.startswith("c:do:update:"):
             shortid = data.rsplit(":", 1)[1]
             c = resolve_container(shortid)
+            _start_kb = (kb([[btn("⬅️ 返回更新列表", "img:list"),
+                              btn("⬅️ 主菜单", "menu:main")]])
+                         if _LAST_IMAGE_CHECK_RESULTS else back_keyboard())
             _edit_or_send(chat_id, message_id,
-                          f"⬆️ 开始更新“{container_display_name(c)}”…正在拉取镜像，完成后会发新消息，过程可能要几分钟。",
-                          back_keyboard())
-            update_container_async(shortid, chat_id)
+                          f"⬆️ 开始更新“{container_display_name(c)}”…正在拉取镜像，完成后会发新消息并回到剩余更新列表，过程可能要几分钟。",
+                          _start_kb)
+            update_container_async(shortid, chat_id, message_id)
         elif data.startswith("c:search:"):
             shortid = data.rsplit(":", 1)[1]
             c = resolve_container(shortid)
