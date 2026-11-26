@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""3 号机器人：NAS + Docker + ESXi 管理（v2.5.3：容器更新支持批量勾选升级）。
+"""3 号机器人：NAS + Docker + ESXi 管理（v2.5.4：附属数据库不单独升级）。
 
 部署在 NAS（ESXi 上的 VM）里的 Docker 容器中，通过 OpenBox SOCKS5 代理
 访问 Telegram Bot API（长轮询，不需要 webhook、不需要开 inbound 端口）。
@@ -11,6 +11,8 @@
 - ESXi：SSH（paramiko）执行 vim-cmd / esxcli。
 - 只认 OWNER_CHAT_ID 一个人；没有任意命令执行功能。
 - 危险操作（停容器、重启容器、关 VM、重启 NAS）要点两次确认。
+- v2.5.4：附属数据库不单独升级：按 Compose 项目识别 postgres/redis 等附属服务，
+  检查时不列更新、单容器更新入口也拦截；数据库版本由 Compose/主程序决定。
 - v2.5.3：容器更新报告去重（正文只留汇总，容器列表只在按钮里）+ 批量勾选：
   点容器名勾选/取消，可全选，选好后一次确认批量升级或批量忽略。
 - v2.5.2：容器更新报告缓存可返回：升级完自动回到剩余更新列表，不用重新全量检测；
@@ -87,7 +89,7 @@ _HOST_DATA_PATHS_RAW = os.environ.get("HOST_DATA_PATHS", "").strip()
 HOST_DATA_PATHS = [p.strip() for p in _HOST_DATA_PATHS_RAW.split(",") if p.strip()] or ["/mnt/PT", "/mnt/Strongge"]
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
-BOT_VERSION = "2.5.3"
+BOT_VERSION = "2.5.4"
 SELF_CONTAINER_NAME = os.environ.get("SELF_CONTAINER_NAME", "tg-bot3").strip() or "tg-bot3"
 ALERT_ENABLED_DEFAULT = os.environ.get("ALERT_ENABLED", "1").strip() not in ("0", "false", "no")
 ALERT_INTERVAL_SEC = _env_int("ALERT_INTERVAL_SEC", 300)
@@ -618,6 +620,11 @@ def _update_container_inner(query):
     image_ref = _container_image_ref(c, inspect_data)
     if not image_ref:
         return False, "读不到该容器的镜像名，无法更新。"
+    companion_project = _companion_project_for(c, inspect_data, image_ref)
+    if companion_project:
+        return False, (f"“{name}”是 {companion_project} 项目的附属数据库，不单独升级："
+                       "单独升数据库可能让主程序因版本不兼容起不来。"
+                       "数据库版本由 Compose 决定，要升请改 compose 里的镜像标签后用 compose 更新。")
     if _is_image_id_ref(image_ref):
         return False, "该容器的镜像只剩 ID（标签已丢失），无法按名字拉取更新；请用 compose 更新。"
     old_image_id = inspect_data.get("Image", "")
@@ -1836,12 +1843,82 @@ def _save_image_check_state(state):
         log("保存镜像检查状态失败：", e)
 
 
+_DB_IMAGE_BASENAMES = {
+    "postgres", "postgresql", "redis", "mysql", "mariadb", "mongo", "mongodb",
+    "memcached", "rabbitmq", "elasticsearch", "opensearch", "clickhouse",
+    "influxdb", "cassandra", "neo4j", "valkey", "dragonfly", "etcd",
+}
+_DB_NAME_TOKENS = {
+    "postgres", "postgresql", "pgsql", "redis", "mysql", "mariadb", "mongo",
+    "mongodb", "memcached", "rabbitmq", "valkey", "etcd",
+}
+
+
+def _is_db_like(image_ref, service, name):
+    """是不是数据库/缓存类镜像：先看镜像仓库名，再看服务名/容器名分词。"""
+    ref = (image_ref or "").strip().lower()
+    base = ref.split("@")[0].rsplit("/", 1)[-1].split(":")[0]
+    if base in _DB_IMAGE_BASENAMES:
+        return True
+    for raw in (service or "", name or ""):
+        for tok in re.split(r"[-_]", raw.lower()):
+            if tok.rstrip("0123456789") in _DB_NAME_TOKENS:
+                return True
+    return False
+
+
+def _compose_labels(c, inspect_data=None):
+    labels = {}
+    if inspect_data:
+        labels.update(((inspect_data.get("Config") or {}).get("Labels") or {}))
+    labels.update(c.get("Labels") or {})
+    return labels
+
+
+def _companion_db_projects(entries):
+    """entries: [{cid, name, image, project, service}]。
+    返回 {cid: project}：多容器 Compose 项目里的数据库类服务算附属，
+    单独升级可能让主程序因版本不兼容起不来，版本应由 Compose 决定。"""
+    by_project = {}
+    for e in entries:
+        if e.get("project"):
+            by_project.setdefault(e["project"], []).append(e)
+    companions = {}
+    for project, group in by_project.items():
+        if len(group) < 2:
+            continue
+        for e in group:
+            if _is_db_like(e.get("image", ""), e.get("service", ""), e.get("name", "")):
+                companions[e["cid"]] = project
+    return companions
+
+
+def _companion_project_for(c, inspect_data, image_ref):
+    """单容器更新时判断它是不是附属数据库；是则返回项目名。"""
+    labels = _compose_labels(c, inspect_data)
+    project = labels.get("com.docker.compose.project", "")
+    if not project:
+        return None
+    if not _is_db_like(image_ref, labels.get("com.docker.compose.service", ""),
+                       container_display_name(c)):
+        return None
+    try:
+        items = list_containers()
+    except Exception:
+        return None
+    group = [i for i in items
+             if (i.get("Labels") or {}).get("com.docker.compose.project") == project]
+    return project if len(group) >= 2 else None
+
+
 def check_container_image_updates():
-    """检查全部容器：返回每容器的检查结果（update/current/error/skipped）。"""
+    """检查全部容器：返回每容器的检查结果（update/current/error/skipped/companion）。"""
     try:
         items = list_containers()
     except Exception as e:
         return [{"status": "fatal", "error": str(e)}]
+    # 第一遍先收集详情，按 Compose 项目识别附属数据库（不单独升级）。
+    entries = []
     results = []
     for c in sorted(items, key=container_display_name):
         name = container_display_name(c)
@@ -1855,8 +1932,22 @@ def check_container_image_updates():
                             "image": (c.get("Image") or "").strip(),
                             "status": "error", "error": f"读详情失败：{e}"})
             continue
-        image_ref = _container_image_ref(c, inspect_data)
+        labels = _compose_labels(c, inspect_data)
+        entries.append({"c": c, "cid": cid, "name": name,
+                        "inspect": inspect_data,
+                        "image": _container_image_ref(c, inspect_data),
+                        "project": labels.get("com.docker.compose.project", ""),
+                        "service": labels.get("com.docker.compose.service", "")})
+    companions = _companion_db_projects(entries)
+    for e in entries:
+        c, cid, name = e["c"], e["cid"], e["name"]
+        inspect_data = e["inspect"]
+        image_ref = e["image"]
         base = {"cid": cid, "name": name, "image": image_ref}
+        if cid in companions:
+            results.append({**base, "status": "companion",
+                            "error": f"附属数据库（{companions[cid]} 项目），随主程序/Compose 管理"})
+            continue
         if not image_ref:
             results.append({**base, "status": "error", "error": "读不到镜像名"})
             continue
@@ -1891,6 +1982,7 @@ def check_container_image_updates():
             results.append({**base, "status": "update", "old_id": old_id, "new_id": new_id})
         else:
             results.append({**base, "status": "current", "old_id": old_id, "new_id": new_id})
+    results.sort(key=lambda r: r.get("name", ""))
     return results
 
 
@@ -1962,6 +2054,7 @@ def format_image_check_report(results, checked_at=None):
     ignored_rows = [r for r in results if r["status"] == "update" and _is_ignored(ignored, r)]
     current = sum(1 for r in results if r["status"] == "current")
     problems = [r for r in results if r["status"] in ("error", "skipped")]
+    companions = [r for r in results if r["status"] == "companion"]
     lines = [f"🔍 容器更新（{checked_at or _LAST_IMAGE_CHECK_TIME or cst_now()}）"]
     if not updates and ignored_rows:
         lines.append("\n没有新的更新（有更新的都已忽略）。")
@@ -1970,11 +2063,15 @@ def format_image_check_report(results, checked_at=None):
     elif not updates:
         lines.append("\n全部容器都已是最新。")
     lines.append(f"\n共 {len(results)} 个容器：{len(updates)} 个有更新，{current} 个已是最新，"
-                 f"{len(problems)} 个检查失败/跳过{'' if not ignored_rows else f'，{len(ignored_rows)} 个已忽略'}。")
+                 f"{len(problems)} 个检查失败/跳过{'' if not ignored_rows else f'，{len(ignored_rows)} 个已忽略'}"
+                 f"{'' if not companions else f'，{len(companions)} 个附属数据库不单独升级'}。")
     for r in problems[:5]:
         lines.append(f"⚠️ {r['name']}：{r.get('error', '')[:40]}")
     if len(problems) > 5:
         lines.append(f"…还有 {len(problems) - 5} 个未列出。")
+    if companions:
+        lines.append("🗄️ 附属数据库（随主程序/Compose 管理）：" +
+                     "、".join(r["name"] for r in companions))
     selected = [r for r in updates if r.get("cid") in _IMAGE_CHECK_SELECTED]
     if updates:
         lines.append(f"\n点容器名勾选（可多选），已选 {len(selected)} 个；选好点 [⬆️ 升级所选]。")
